@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # JanRaksha AI
 
 JanRaksha AI is a responsible, AI-assisted missing-person case-management prototype. It uses synthetic data only. Similarity output is a potential lead, never an identification.
@@ -38,3 +39,7 @@ When a found-person report produces a potential match, the registered case owner
 ## Safety and privacy
 
 Restricted notes and case updates require investigator/admin roles. The application intentionally excludes government databases and any claim of automatic recognition. Configure regional emergency contacts outside source code and do not publish private contact details or precise home addresses.
+=======
+# Janraksha-AI
+AI based missing person identification using deep learning and safety platform
+>>>>>>> 5dd9e0301644696a41d979ad77ed4a4c61c5066f
