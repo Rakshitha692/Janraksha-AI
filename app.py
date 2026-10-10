@@ -1,4 +1,4 @@
-import os, uuid, base64, smtplib, json
+import os, uuid, base64, smtplib, json, math, re
 from threading import Lock
 from email.message import EmailMessage
 from datetime import datetime, date, timedelta
@@ -9,6 +9,7 @@ import cv2
 import numpy as np
 from flask import Flask, jsonify, request, session, send_from_directory
 from flask_sqlalchemy import SQLAlchemy
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
 
@@ -37,9 +38,13 @@ db = SQLAlchemy(app)
 webcam_tracks = {}
 webcam_tracks_lock = Lock()
 
-ROLES = {'FAMILY_USER', 'CITIZEN', 'INVESTIGATOR', 'ADMIN_DEMO'}
+ROLES = {'FAMILY_USER', 'CITIZEN', 'INVESTIGATOR', 'ADMIN_DEMO', 'POLICE_OFFICER'}
+PUBLIC_REGISTRATION_ROLES = {'FAMILY_USER', 'CITIZEN', 'INVESTIGATOR'}
 CASE_STATUSES = {'ACTIVE', 'UNDER REVIEW', 'RELEVANT LEAD', 'PERSON_FOUND', 'PERSON FOUND', 'CLOSED'}
 MATCH_STATUSES = {'REQUIRES_HUMAN_VERIFICATION', 'VERIFIED_BY_AUTHORIZED_USER', 'NOT_RELEVANT'}
+EMERGENCY_CATEGORIES = {'ACCIDENT', 'FIRE', 'MEDICAL', 'POLICE', 'WOMEN_SAFETY', 'CHILD_SAFETY'}
+EMERGENCY_CASE_STATUSES = {'PENDING', 'IN_PROGRESS', 'RESOLVED'}
+EMAIL_PATTERN = re.compile(r'^[^@\s]+@[^@\s]+\.[^@\s]+$')
 
 
 class User(db.Model):
@@ -171,6 +176,35 @@ class EmergencyEvent(db.Model):
     location_name = db.Column(db.String(200)); message = db.Column(db.Text); created_at = db.Column(db.DateTime, default=datetime.utcnow); cancelled_at = db.Column(db.DateTime)
 
 
+class PoliceOfficer(db.Model):
+    __tablename__ = 'police_officers'
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False, unique=True)
+    police_id = db.Column(db.String(40), nullable=False, unique=True, index=True)
+    is_active = db.Column(db.Boolean, nullable=False, default=True)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+
+
+class EmergencyCase(db.Model):
+    __tablename__ = 'emergency_cases'
+    id = db.Column(db.Integer, primary_key=True)
+    case_id = db.Column(db.String(32), nullable=False, unique=True, index=True)
+    submission_key = db.Column(db.String(64), unique=True, index=True)
+    category = db.Column(db.String(30), nullable=False, index=True)
+    reporter_user_id = db.Column(db.Integer, db.ForeignKey('user.id'), index=True)
+    reporter_name = db.Column(db.String(120), nullable=False)
+    reporter_contact = db.Column(db.String(160))
+    description = db.Column(db.Text, nullable=False)
+    location_name = db.Column(db.String(200), nullable=False)
+    latitude = db.Column(db.Float)
+    longitude = db.Column(db.Float)
+    attachment = db.Column(db.String(255))
+    status = db.Column(db.String(20), nullable=False, default='PENDING', index=True)
+    assigned_officer_id = db.Column(db.Integer, db.ForeignKey('user.id'), index=True)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow, index=True)
+    updated_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
 def normalize_match_status(value):
     return (value or '').upper().replace(' ', '_')
 
@@ -242,6 +276,19 @@ def save_file(file):
     return f'/uploads/{name}'
 
 
+def save_emergency_attachment(file):
+    if not file or not file.filename:
+        return None
+    ext = os.path.splitext(secure_filename(file.filename))[1].lower()
+    if ext not in {'.jpg', '.jpeg', '.png'}:
+        raise ValueError('Only JPG, JPEG and PNG images are accepted.')
+    name = f'{uuid.uuid4().hex}{ext}'
+    folder = os.path.join(app.config['UPLOAD_FOLDER'], 'emergency-cases')
+    os.makedirs(folder, exist_ok=True)
+    file.save(os.path.join(folder, name))
+    return os.path.join('emergency-cases', name)
+
+
 def next_webcam_session_id():
     prefix = f'WC-{datetime.utcnow().year}-'
     last = WebcamSession.query.filter(WebcamSession.session_id.like(prefix + '%')).order_by(WebcamSession.session_id.desc()).first()
@@ -295,6 +342,19 @@ def detect_multiple_faces(frame_path):
     if len(faces) == 0:
         return []
     return [{'x': int(x), 'y': int(y), 'width': int(w), 'height': int(h)} for x, y, w, h in sorted(faces, key=lambda item: item[2] * item[3], reverse=True)]
+
+
+def _expanded_face_crop(image, face):
+    image_height, image_width = image.shape[:2]
+    x, y = face['x'], face['y']
+    width, height = face['width'], face['height']
+    margin_x = round(width * 0.15)
+    margin_y = round(height * 0.15)
+    left = max(0, x - margin_x)
+    top = max(0, y - margin_y)
+    right = min(image_width, x + width + margin_x)
+    bottom = min(image_height, y + height + margin_y)
+    return image[top:bottom, left:right]
 
 
 def _face_quality_metrics(face_image):
@@ -412,38 +472,6 @@ def _face_match_evidence(similarity_score, quality_score, pose_score, reference_
     return float(np.clip(combined, 0, 100))
 
 
-def search_missing_persons(embedding, source_type=None, source_id=None, similarity_threshold=55.0, record_matches=True):
-    vector = np.asarray(embedding, dtype=np.float32)
-    grouped = {}
-    for row in FaceEmbedding.query.all():
-        stored = np.array(json.loads(row.embedding_vector), dtype=np.float32)
-        if stored.size != vector.size:
-            continue
-        score = float(np.clip(np.dot(vector, stored), -1, 1))
-        similarity = min(99.9, round((score + 1) * 50, 1))
-        if similarity < similarity_threshold:
-            continue
-        person = db.session.get(MissingPerson, row.missing_person_id)
-        if not person:
-            continue
-        entry = grouped.setdefault(person.id, {'person': person, 'best_similarity': 0.0, 'best_evidence': 0.0})
-        evidence = _face_match_evidence(similarity, 0.9, 0.9, _reference_agreement(similarity), 1.0, 0.8)
-        entry['best_similarity'] = max(entry['best_similarity'], similarity)
-        entry['best_evidence'] = max(entry['best_evidence'], evidence)
-    results = []
-    for entry in grouped.values():
-        if entry['best_evidence'] >= 80:
-            results.append({'person': entry['person'], 'similarity': round(entry['best_similarity'], 1), 'combined_score': round(entry['best_evidence'], 1)})
-    results.sort(key=lambda item: item['combined_score'], reverse=True)
-    results = results[:10]
-    if record_matches:
-        for result in results:
-            db.session.add(AIMatch(source_type=source_type, source_id=source_id, missing_person_id=result['person'].id,
-                                  similarity_score=result['similarity'], combined_score=result['combined_score'],
-                                  status='REQUIRES_HUMAN_VERIFICATION'))
-    return results
-
-
 def _bbox_iou(first, second):
     left = max(first['x'], second['x'])
     top = max(first['y'], second['y'])
@@ -529,19 +557,35 @@ def generate_embedding(face_path):
     return vector.astype(np.float32)
 
 
-def search_missing_persons(embedding, source_type=None, source_id=None, similarity_threshold=55.0, record_matches=True):
+def search_missing_persons(embedding, source_type=None, source_id=None, similarity_threshold=55.0,
+                          record_matches=True, include_low_confidence=False):
     vector = np.asarray(embedding, dtype=np.float32)
     grouped = {}
     for row in FaceEmbedding.query.all():
+        person = db.session.get(MissingPerson, row.missing_person_id)
+        if not person:
+            continue
         stored = np.array(json.loads(row.embedding_vector), dtype=np.float32)
         if stored.size != vector.size:
-            continue
+            image_name = os.path.basename(person.photo or '')
+            image_path = os.path.join(app.config['UPLOAD_FOLDER'], image_name)
+            if not image_name or not os.path.isfile(image_path):
+                continue
+            try:
+                stored = embedding_from_file(image_path)
+            except ValueError as error:
+                app.logger.warning(
+                    'Could not refresh the saved face reference for case %s: %s',
+                    person.case_id,
+                    error,
+                )
+                continue
+            row.embedding_vector = json.dumps(stored.tolist())
+            row.model_name = 'opencv-normalized-face-descriptor'
+            row.embedding_dimension = int(stored.size)
         score = float(np.clip(np.dot(vector, stored), -1, 1))
         similarity = min(99.9, round((score + 1) * 50, 1))
         if similarity < similarity_threshold:
-            continue
-        person = db.session.get(MissingPerson, row.missing_person_id)
-        if not person:
             continue
         entry = grouped.setdefault(person.id, {'person': person, 'best_similarity': 0.0, 'best_evidence': 0.0})
         evidence = _face_match_evidence(similarity, 0.9, 0.9, _reference_agreement(similarity), 1.0, 0.8)
@@ -549,7 +593,7 @@ def search_missing_persons(embedding, source_type=None, source_id=None, similari
         entry['best_evidence'] = max(entry['best_evidence'], evidence)
     results = []
     for entry in grouped.values():
-        if entry['best_evidence'] >= 80:
+        if entry['best_evidence'] >= 80 or include_low_confidence:
             results.append({'person': entry['person'], 'similarity': round(entry['best_similarity'], 1), 'combined_score': round(entry['best_evidence'], 1)})
     results.sort(key=lambda item: item['combined_score'], reverse=True)
     results = results[:10]
@@ -562,22 +606,13 @@ def search_missing_persons(embedding, source_type=None, source_id=None, similari
 
 
 def embedding_from_file(path):
-    """Fallback adapter: OpenCV detection + normalized image descriptor. Swap this function for ArcFace/FaceNet in production."""
     image = cv2.imread(path)
     if image is None:
         raise ValueError('The uploaded image could not be read.')
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    faces = []
-    if hasattr(cv2, 'CascadeClassifier'):
-        cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
-        faces = cascade.detectMultiScale(gray, 1.15, 5)
-    if len(faces):
-        x, y, w, h = max(faces, key=lambda v: v[2] * v[3])
-        gray = gray[y:y + h, x:x + w]
-    gray = cv2.resize(gray, (32, 16)).astype(np.float32).flatten()
-    gray = (gray - gray.mean()) / (gray.std() + 1e-6)
-    norm = np.linalg.norm(gray)
-    return gray / norm if norm > 1e-6 else np.full(gray.shape, 1 / np.sqrt(len(gray)), dtype=np.float32)
+    faces = detect_multiple_faces(path)
+    if not faces:
+        raise ValueError('No face was detected in the registration photo. Use a clear, front-facing portrait.')
+    return generate_embedding(_expanded_face_crop(image, faces[0]))
 
 
 def search_embedding(vector, source_type=None, source_id=None):
@@ -662,6 +697,11 @@ def index():
     return send_app_index()
 
 
+@app.get('/police')
+def police_portal_page():
+    return send_app_index()
+
+
 @app.get('/investigator/matches/<int:match_id>')
 def investigator_match_page(match_id):
     return send_app_index()
@@ -669,6 +709,8 @@ def investigator_match_page(match_id):
 
 @app.get('/uploads/<path:name>')
 def uploads(name):
+    if name.replace('\\', '/').lstrip('/').startswith('emergency-cases/'):
+        return api_error('Resource not found.', 404)
     return send_from_directory(app.config['UPLOAD_FOLDER'], name)
 
 
@@ -677,12 +719,81 @@ def register():
     d = request.get_json() or {}; email = (d.get('email') or '').strip().lower(); role = d.get('role', 'FAMILY_USER')
     if not all([d.get('name'), email, d.get('password'), d.get('terms')]):
         return api_error('Name, email, password and terms acceptance are required.')
-    if role not in ROLES:
-        return api_error('Invalid role.')
+    if role not in PUBLIC_REGISTRATION_ROLES:
+        return api_error('Choose Family member, Citizen, or Investigator.')
     if User.query.filter_by(email=email).first():
         return api_error('An account with that email already exists.', 409)
     u = User(name=d['name'].strip(), email=email, phone=d.get('phone'), password_hash=generate_password_hash(d['password']), role=role, location=d.get('location'))
     db.session.add(u); db.session.commit(); session['user_id'] = u.id; return jsonify(user=user_json(u)), 201
+
+
+@app.post('/api/police/login')
+def police_login():
+    data = request.get_json(silent=True) or {}
+    identifier = str(data.get('identifier') or '').strip()
+    password = data.get('password') or ''
+    if not identifier or not password:
+        return api_error('Police ID or email and password are required.', 400)
+    officer = PoliceOfficer.query.filter(
+        db.func.lower(PoliceOfficer.police_id) == identifier.lower(),
+        PoliceOfficer.is_active.is_(True),
+    ).first()
+    if not officer and '@' in identifier:
+        user = User.query.filter_by(email=identifier.lower(), role='POLICE_OFFICER').first()
+        officer = PoliceOfficer.query.filter_by(user_id=user.id, is_active=True).first() if user else None
+    user = db.session.get(User, officer.user_id) if officer else None
+    if not officer or not user or user.role != 'POLICE_OFFICER' or not check_password_hash(user.password_hash, password):
+        return api_error('Police ID/email or password is incorrect.', 401)
+    session.clear()
+    session['user_id'] = user.id
+    return jsonify(user=user_json(user), police_id=officer.police_id)
+
+
+@app.post('/api/police/logout')
+def police_logout():
+    session.clear()
+    return jsonify(message='Signed out of the Police Portal.')
+
+
+@app.post('/api/police/officers')
+@require_auth({'ADMIN_DEMO'})
+def create_police_officer():
+    data = request.get_json(silent=True) or {}
+    police_id = str(data.get('police_id') or '').strip()
+    name = str(data.get('name') or '').strip()
+    email = str(data.get('email') or '').strip().lower()
+    password = data.get('password') or ''
+    phone = str(data.get('phone') or '').strip() or None
+    if (not police_id or len(police_id) > 40 or not re.fullmatch(r'[A-Za-z0-9_-]{3,40}', police_id)
+            or not name or len(name) > 120 or not EMAIL_PATTERN.fullmatch(email) or len(email) > 160):
+        return api_error('Police ID, name, and email are required and must fit their field limits.')
+    if len(password) < 8:
+        return api_error('Police account passwords must contain at least 8 characters.')
+    if User.query.filter_by(email=email).first() or PoliceOfficer.query.filter(
+        db.func.lower(PoliceOfficer.police_id) == police_id.lower()
+    ).first():
+        return api_error('That email or Police ID is already registered.', 409)
+    user = User(
+        name=name, email=email, phone=phone,
+        password_hash=generate_password_hash(password),
+        role='POLICE_OFFICER',
+    )
+    db.session.add(user)
+    try:
+        db.session.flush()
+        officer = PoliceOfficer(user_id=user.id, police_id=police_id)
+        db.session.add(officer)
+        db.session.commit()
+    except IntegrityError:
+        db.session.rollback()
+        return api_error('That email or Police ID is already registered.', 409)
+    except SQLAlchemyError:
+        db.session.rollback()
+        app.logger.exception('Failed to create police officer account.')
+        return api_error('The police account could not be saved.', 500)
+    return jsonify(message='Police officer account created.', officer={
+        'police_id': officer.police_id, 'name': user.name, 'email': user.email,
+    }), 201
 
 
 @app.post('/api/auth/login')
@@ -690,6 +801,9 @@ def login():
     d = request.get_json() or {}; u = User.query.filter_by(email=(d.get('email') or '').lower()).first()
     if not u or not check_password_hash(u.password_hash, d.get('password', '')):
         return api_error('Invalid email or password.', 401)
+    if u.role == 'POLICE_OFFICER':
+        return api_error('Please sign in through the Police Portal.', 403)
+    session.clear()
     session['user_id'] = u.id; return jsonify(user=user_json(u))
 
 
@@ -709,8 +823,19 @@ def webcam_search_page():
     return send_app_index()
 
 
+def can_access_webcam_session(session_record):
+    user = current_user()
+    return bool(
+        user
+        and (
+            user.role in {'INVESTIGATOR', 'ADMIN_DEMO'}
+            or session_record.investigator_id == user.id
+        )
+    )
+
+
 @app.post('/api/ai/webcam/start')
-@require_auth({'INVESTIGATOR', 'ADMIN_DEMO'})
+@require_auth({'FAMILY_USER', 'CITIZEN', 'INVESTIGATOR', 'ADMIN_DEMO'})
 def webcam_start():
     payload = request.get_json(silent=True) or {}
     session_record = WebcamSession(
@@ -738,7 +863,7 @@ def webcam_start():
 
 
 @app.post('/api/ai/webcam/process-frame')
-@require_auth({'INVESTIGATOR', 'ADMIN_DEMO'})
+@require_auth({'FAMILY_USER', 'CITIZEN', 'INVESTIGATOR', 'ADMIN_DEMO'})
 def webcam_process_frame():
     session_id = (request.form.get('session_id') or '').strip() or (request.get_json(silent=True) or {}).get('session_id')
     if not session_id:
@@ -746,6 +871,8 @@ def webcam_process_frame():
     session_record = WebcamSession.query.filter_by(session_id=session_id).first()
     if not session_record:
         return api_error('Webcam session not found.', 404)
+    if not can_access_webcam_session(session_record):
+        return api_error('You do not have permission to access this webcam session.', 403)
     if session_record.status != 'ACTIVE':
         return api_error('This monitoring session is not active.', 409)
     if 'frame' not in request.files:
@@ -766,7 +893,7 @@ def webcam_process_frame():
             try:
                 image = cv2.imread(file_path)
                 if image is not None:
-                    raw_crop = image[face['y']:face['y'] + face['height'], face['x']:face['x'] + face['width']]
+                    raw_crop = _expanded_face_crop(image, face)
             except Exception:
                 raw_crop = None
 
@@ -781,7 +908,14 @@ def webcam_process_frame():
                     evidence_message = quality['reason']
                 else:
                     embedding = generate_embedding(raw_crop)
-                    matches = search_missing_persons(embedding, source_type='WEBCAM', source_id=session_record.id, record_matches=False, similarity_threshold=65.0)
+                    matches = search_missing_persons(
+                        embedding,
+                        source_type='WEBCAM',
+                        source_id=session_record.id,
+                        record_matches=False,
+                        similarity_threshold=0.0,
+                        include_low_confidence=True,
+                    )
                     if matches:
                         best = matches[0]
                         similarity_score = float(best['similarity'])
@@ -846,13 +980,15 @@ def webcam_process_frame():
 
 
 @app.post('/api/ai/webcam/stop')
-@require_auth({'INVESTIGATOR', 'ADMIN_DEMO'})
+@require_auth({'FAMILY_USER', 'CITIZEN', 'INVESTIGATOR', 'ADMIN_DEMO'})
 def webcam_stop():
     payload = request.get_json(silent=True) or {}
     session_id = (payload.get('session_id') or request.form.get('session_id') or '').strip()
     session_record = WebcamSession.query.filter_by(session_id=session_id).first() if session_id else None
     if not session_record:
         return api_error('Webcam session not found.', 404)
+    if not can_access_webcam_session(session_record):
+        return api_error('You do not have permission to access this webcam session.', 403)
     session_record.status = 'STOPPED'; session_record.ended_at = datetime.utcnow(); db.session.commit()
     with webcam_tracks_lock:
         webcam_tracks.pop(session_record.session_id, None)
@@ -860,11 +996,13 @@ def webcam_stop():
 
 
 @app.get('/api/ai/webcam/session/<session_id>')
-@require_auth({'INVESTIGATOR', 'ADMIN_DEMO'})
+@require_auth({'FAMILY_USER', 'CITIZEN', 'INVESTIGATOR', 'ADMIN_DEMO'})
 def webcam_session_details(session_id):
     session_record = WebcamSession.query.filter_by(session_id=session_id).first()
     if not session_record:
         return api_error('Webcam session not found.', 404)
+    if not can_access_webcam_session(session_record):
+        return api_error('You do not have permission to access this webcam session.', 403)
     return jsonify(success=True, session={
         'id': session_record.id,
         'session_id': session_record.session_id,
@@ -882,11 +1020,13 @@ def webcam_session_details(session_id):
 
 
 @app.get('/api/ai/webcam/session/<session_id>/matches')
-@require_auth({'INVESTIGATOR', 'ADMIN_DEMO'})
+@require_auth({'FAMILY_USER', 'CITIZEN', 'INVESTIGATOR', 'ADMIN_DEMO'})
 def webcam_session_matches(session_id):
     session_record = WebcamSession.query.filter_by(session_id=session_id).first()
     if not session_record:
         return api_error('Webcam session not found.', 404)
+    if not can_access_webcam_session(session_record):
+        return api_error('You do not have permission to access this webcam session.', 403)
     rows = WebcamDetection.query.filter_by(session_id=session_id).order_by(WebcamDetection.created_at.desc()).all()
     return jsonify(success=True, matches=[{
         'id': row.id,
@@ -913,6 +1053,7 @@ def list_people():
 @app.post('/api/missing-persons')
 @require_auth({'FAMILY_USER', 'INVESTIGATOR', 'ADMIN_DEMO'})
 def create_person():
+    photo = None
     try:
         photo = save_file(request.files.get('photo')); d = request.form
         if not d.get('name') or not photo:
@@ -922,11 +1063,17 @@ def create_person():
                          latitude=float(d['latitude']) if d.get('latitude') else None, longitude=float(d['longitude']) if d.get('longitude') else None,
                          last_seen_date=date.fromisoformat(d['last_seen_date']) if d.get('last_seen_date') else None, last_seen_time=d.get('last_seen_time'))
         db.session.add(p); db.session.flush(); vector = embedding_from_file(os.path.join(app.config['UPLOAD_FOLDER'], os.path.basename(photo)))
-        db.session.add(FaceEmbedding(missing_person_id=p.id, embedding_vector=json.dumps(vector.tolist()), model_name='opencv-fallback-descriptor', embedding_dimension=len(vector)))
+        db.session.add(FaceEmbedding(missing_person_id=p.id, embedding_vector=json.dumps(vector.tolist()), model_name='opencv-normalized-face-descriptor', embedding_dimension=len(vector)))
         add_timeline(p.case_id, 'CASE_REGISTERED', 'Missing-person case registered.', current_user().id)
         db.session.add(Notification(user_id=current_user().id, title='Case created', message=f'{p.case_id} was created successfully.', type='success'))
         db.session.commit(); return jsonify(message='Missing-person case created successfully.', person=person_json(p)), 201
     except ValueError as e:
+        db.session.rollback()
+        if photo:
+            try:
+                os.remove(os.path.join(app.config['UPLOAD_FOLDER'], os.path.basename(photo)))
+            except OSError:
+                app.logger.exception('Could not remove a rejected missing-person photo.')
         return api_error(str(e))
 
 
@@ -1302,6 +1449,230 @@ def cancel_sos(event_id):
 @require_auth()
 def emergency_history():
     rows = EmergencyEvent.query.filter_by(user_id=current_user().id).order_by(EmergencyEvent.created_at.desc()).all(); return jsonify(items=[{'id': x.id, 'status': x.status, 'location_name': x.location_name, 'message': x.message, 'created_at': x.created_at.isoformat(), 'cancelled_at': x.cancelled_at.isoformat() if x.cancelled_at else None} for x in rows])
+
+
+def emergency_case_json(case):
+    officer = db.session.get(User, case.assigned_officer_id) if case.assigned_officer_id else None
+    return {
+        'case_id': case.case_id,
+        'category': case.category,
+        'reporter_user_id': case.reporter_user_id,
+        'reporter_name': case.reporter_name,
+        'reporter_contact': case.reporter_contact,
+        'description': case.description,
+        'location_name': case.location_name,
+        'latitude': case.latitude,
+        'longitude': case.longitude,
+        'attachment': f'/api/emergency/case-attachments/{case.case_id}' if case.attachment else None,
+        'status': case.status,
+        'assigned_officer_id': case.assigned_officer_id,
+        'assigned_officer_name': officer.name if officer else None,
+        'created_at': case.created_at.isoformat(),
+        'updated_at': case.updated_at.isoformat(),
+    }
+
+
+def remove_emergency_attachment(attachment):
+    if not attachment:
+        return
+    try:
+        os.remove(os.path.join(app.config['UPLOAD_FOLDER'], attachment))
+    except OSError:
+        app.logger.exception('Could not remove an orphaned emergency attachment.')
+
+
+@app.post('/api/emergency/cases')
+@require_auth()
+def create_emergency_case():
+    user = current_user()
+    category = str(request.form.get('category') or '').strip().upper()
+    description = str(request.form.get('description') or '').strip()
+    location_name = str(request.form.get('location_name') or '').strip()
+    reporter_name = str(request.form.get('reporter_name') or user.name).strip()
+    reporter_contact = str(request.form.get('reporter_contact') or user.phone or user.email).strip()
+    submission_key = str(request.form.get('submission_key') or '').strip() or None
+    if category not in EMERGENCY_CATEGORIES:
+        return api_error('Choose a valid emergency category.')
+    if not description or len(description) > 5000:
+        return api_error('Incident description is required and must be 5,000 characters or fewer.')
+    if not location_name or len(location_name) > 200:
+        return api_error('Incident location is required and must be 200 characters or fewer.')
+    if not reporter_name or len(reporter_name) > 120 or len(reporter_contact) > 160:
+        return api_error('Reporter name or contact exceeds the allowed length.')
+    if submission_key and len(submission_key) > 64:
+        return api_error('Invalid submission token.')
+    try:
+        latitude = float(request.form['latitude']) if request.form.get('latitude') else None
+        longitude = float(request.form['longitude']) if request.form.get('longitude') else None
+    except ValueError:
+        return api_error('Coordinates must be valid numbers.')
+    if ((latitude is None) != (longitude is None)
+            or (latitude is not None and (not math.isfinite(latitude) or not -90 <= latitude <= 90))
+            or (longitude is not None and (not math.isfinite(longitude) or not -180 <= longitude <= 180))):
+        return api_error('Provide both valid latitude and longitude coordinates.')
+    if submission_key:
+        existing = EmergencyCase.query.filter_by(submission_key=submission_key).first()
+        if existing:
+            if existing.reporter_user_id != user.id:
+                return api_error('Submission token has already been used.', 409)
+            return jsonify(message='This emergency report was already received.', case=emergency_case_json(existing)), 200
+    try:
+        attachment = save_emergency_attachment(request.files.get('attachment'))
+    except ValueError as error:
+        return api_error(str(error))
+    case = EmergencyCase(
+        case_id=f'EM-{datetime.utcnow():%Y%m%d}-{uuid.uuid4().hex[:10].upper()}',
+        submission_key=submission_key,
+        category=category,
+        reporter_user_id=user.id,
+        reporter_name=reporter_name,
+        reporter_contact=reporter_contact or None,
+        description=description,
+        location_name=location_name,
+        latitude=latitude,
+        longitude=longitude,
+        attachment=attachment,
+    )
+    db.session.add(case)
+    try:
+        db.session.commit()
+    except IntegrityError:
+        db.session.rollback()
+        duplicate = EmergencyCase.query.filter_by(submission_key=submission_key).first() if submission_key else None
+        if duplicate and duplicate.reporter_user_id == user.id:
+            remove_emergency_attachment(attachment)
+            return jsonify(message='This emergency report was already received.', case=emergency_case_json(duplicate)), 200
+        remove_emergency_attachment(attachment)
+        return api_error('Emergency report conflicts with an existing submission.', 409)
+    except SQLAlchemyError:
+        db.session.rollback()
+        remove_emergency_attachment(attachment)
+        app.logger.exception('Failed to save emergency case.')
+        return api_error('Emergency report could not be saved. Please try again.', 500)
+    return jsonify(message='Emergency report submitted successfully.', case=emergency_case_json(case)), 201
+
+
+@app.get('/api/emergency/case-attachments/<case_id>')
+@require_auth()
+def get_emergency_attachment(case_id):
+    case = EmergencyCase.query.filter_by(case_id=case_id).first()
+    user = current_user()
+    if not case or not case.attachment:
+        return api_error('Emergency attachment not found.', 404)
+    if user.role not in {'POLICE_OFFICER', 'ADMIN_DEMO'} and case.reporter_user_id != user.id:
+        return api_error('You do not have permission to access this attachment.', 403)
+    return send_from_directory(
+        os.path.join(app.config['UPLOAD_FOLDER'], 'emergency-cases'),
+        os.path.basename(case.attachment),
+    )
+
+
+@app.get('/api/emergency/cases/mine')
+@require_auth()
+def my_emergency_cases():
+    cases = EmergencyCase.query.filter_by(
+        reporter_user_id=current_user().id
+    ).order_by(EmergencyCase.created_at.desc()).limit(50).all()
+    return jsonify(items=[emergency_case_json(case) for case in cases])
+
+
+@app.get('/api/police/cases')
+@require_auth({'POLICE_OFFICER', 'ADMIN_DEMO'})
+def list_police_cases():
+    category = request.args.get('category', '').strip().upper()
+    status = request.args.get('status', '').strip().upper()
+    search = request.args.get('search', '').strip()
+    from_date = request.args.get('from_date', '').strip()
+    to_date = request.args.get('to_date', '').strip()
+    if category and category not in EMERGENCY_CATEGORIES:
+        return api_error('Invalid emergency category.')
+    if status and status not in EMERGENCY_CASE_STATUSES:
+        return api_error('Invalid case status.')
+    try:
+        start_date = date.fromisoformat(from_date) if from_date else None
+        end_date = date.fromisoformat(to_date) if to_date else None
+    except ValueError:
+        return api_error('Dates must use YYYY-MM-DD format.')
+    if start_date and end_date and start_date > end_date:
+        return api_error('Start date must not be after end date.')
+    query = EmergencyCase.query
+    if category:
+        query = query.filter_by(category=category)
+    if status:
+        query = query.filter_by(status=status)
+    if search:
+        pattern = f'%{search[:120]}%'
+        query = query.filter(db.or_(
+            EmergencyCase.case_id.ilike(pattern),
+            EmergencyCase.description.ilike(pattern),
+        ))
+    if start_date:
+        query = query.filter(EmergencyCase.created_at >= datetime.combine(start_date, datetime.min.time()))
+    if end_date:
+        query = query.filter(EmergencyCase.created_at < datetime.combine(end_date + timedelta(days=1), datetime.min.time()))
+    try:
+        page = max(1, int(request.args.get('page', '1')))
+        per_page = min(100, max(1, int(request.args.get('per_page', '50'))))
+    except ValueError:
+        return api_error('Page and page size must be valid integers.')
+    total = query.count()
+    items = query.order_by(EmergencyCase.created_at.desc()).offset((page - 1) * per_page).limit(per_page).all()
+    counts = dict(db.session.query(EmergencyCase.status, db.func.count(EmergencyCase.id)).group_by(EmergencyCase.status).all())
+    return jsonify(
+        items=[emergency_case_json(case) for case in items],
+        total=total,
+        page=page,
+        per_page=per_page,
+        pages=(total + per_page - 1) // per_page,
+        counts={
+            'total': total,
+            'pending': counts.get('PENDING', 0),
+            'in_progress': counts.get('IN_PROGRESS', 0),
+            'resolved': counts.get('RESOLVED', 0),
+        },
+        officers=[
+            {'user_id': officer.user_id, 'police_id': officer.police_id, 'name': db.session.get(User, officer.user_id).name}
+            for officer in PoliceOfficer.query.filter_by(is_active=True).order_by(PoliceOfficer.police_id).all()
+        ],
+    )
+
+
+@app.get('/api/police/cases/<case_id>')
+@require_auth({'POLICE_OFFICER', 'ADMIN_DEMO'})
+def get_police_case(case_id):
+    case = EmergencyCase.query.filter_by(case_id=case_id).first()
+    if not case:
+        return api_error('Emergency case not found.', 404)
+    return jsonify(case=emergency_case_json(case))
+
+
+@app.put('/api/police/cases/<case_id>')
+@require_auth({'POLICE_OFFICER', 'ADMIN_DEMO'})
+def update_police_case(case_id):
+    case = EmergencyCase.query.filter_by(case_id=case_id).first()
+    if not case:
+        return api_error('Emergency case not found.', 404)
+    data = request.get_json(silent=True) or {}
+    status = str(data.get('status') or case.status).strip().upper()
+    if status not in EMERGENCY_CASE_STATUSES:
+        return api_error('Choose Pending, In Progress, or Resolved as the case status.')
+    assigned_officer_id = data.get('assigned_officer_id', case.assigned_officer_id)
+    if assigned_officer_id in ('', None):
+        assigned_officer_id = None
+    elif not isinstance(assigned_officer_id, int):
+        return api_error('Assigned officer must be a valid officer account.')
+    elif not PoliceOfficer.query.filter_by(user_id=assigned_officer_id, is_active=True).first():
+        return api_error('Assigned officer must be an active police officer.', 400)
+    case.status = status
+    case.assigned_officer_id = assigned_officer_id
+    case.updated_at = datetime.utcnow()
+    try:
+        db.session.commit()
+    except SQLAlchemyError:
+        db.session.rollback()
+        app.logger.exception('Failed to update emergency case %s.', case_id)
+        return api_error('Emergency case could not be updated.', 500)
+    return jsonify(message='Emergency case updated.', case=emergency_case_json(case))
 
 
 @app.errorhandler(413)

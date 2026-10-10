@@ -1,4 +1,6 @@
 from io import BytesIO
+import json
+import tempfile
 
 import cv2
 import numpy as np
@@ -7,6 +9,7 @@ from unittest.mock import patch
 
 from app import (
     AIMatch,
+    FaceEmbedding,
     WebcamDetection,
     WebcamSession,
     app,
@@ -45,6 +48,17 @@ def create_user(email='investigator@example.com', role='INVESTIGATOR'):
     return user
 
 
+def make_face_frame(offset=0, alpha=1.0, beta=0):
+    image = np.full((220, 200, 3), 155, dtype=np.uint8)
+    center_x, center_y = 100 + offset, 110
+    cv2.ellipse(image, (center_x, center_y), (55, 78), 0, 0, 360, (92, 108, 126), -1)
+    cv2.ellipse(image, (center_x - 22, center_y - 18), (9, 6), 0, 0, 360, (25, 30, 35), -1)
+    cv2.ellipse(image, (center_x + 22, center_y - 18), (9, 6), 0, 0, 360, (25, 30, 35), -1)
+    cv2.line(image, (center_x, center_y - 12), (center_x - 4, center_y + 20), (40, 45, 50), 4)
+    cv2.ellipse(image, (center_x, center_y + 40), (23, 8), 0, 0, 180, (35, 35, 40), 3)
+    return cv2.convertScaleAbs(image, alpha=alpha, beta=beta)
+
+
 def test_webcam_start_requires_auth(client):
     response = client.post('/api/ai/webcam/start', json={})
     assert response.status_code == 401
@@ -61,6 +75,46 @@ def test_investigator_can_start_webcam_session(client):
     assert payload['success'] is True
     assert payload['session']['session_id'].startswith('WC-')
     assert payload['session']['status'] == 'ACTIVE'
+
+
+@pytest.mark.parametrize('role', ['CITIZEN', 'FAMILY_USER'])
+def test_community_user_can_create_view_and_stop_their_own_webcam_session(client, role):
+    user = create_user(email=f'{role.lower()}@example.com', role=role)
+    with client.session_transaction() as sess:
+        sess['user_id'] = user.id
+
+    started = client.post('/api/ai/webcam/start', json={})
+    assert started.status_code == 200
+    session_id = started.get_json()['session']['session_id']
+
+    details = client.get(f'/api/ai/webcam/session/{session_id}')
+    assert details.status_code == 200
+    assert details.get_json()['session']['investigator_id'] == user.id
+    assert client.get(f'/api/ai/webcam/session/{session_id}/matches').status_code == 200
+
+    stopped = client.post('/api/ai/webcam/stop', json={'session_id': session_id})
+    assert stopped.status_code == 200
+    assert stopped.get_json()['session']['status'] == 'STOPPED'
+
+
+def test_community_users_cannot_access_another_users_webcam_session(client):
+    owner = create_user(email='owner@example.com', role='CITIZEN')
+    with client.session_transaction() as sess:
+        sess['user_id'] = owner.id
+    started = client.post('/api/ai/webcam/start', json={})
+    session_id = started.get_json()['session']['session_id']
+
+    other_user = create_user(email='other@example.com', role='FAMILY_USER')
+    with client.session_transaction() as sess:
+        sess['user_id'] = other_user.id
+
+    assert client.get(f'/api/ai/webcam/session/{session_id}').status_code == 403
+    assert client.get(f'/api/ai/webcam/session/{session_id}/matches').status_code == 403
+    assert client.post('/api/ai/webcam/stop', json={'session_id': session_id}).status_code == 403
+    assert client.post(
+        '/api/ai/webcam/process-frame',
+        data={'session_id': session_id},
+    ).status_code == 403
 
 
 def test_process_frame_detects_multiple_tracked_faces_with_ai_evidence_statuses(client):
@@ -113,6 +167,68 @@ def test_process_frame_detects_multiple_tracked_faces_with_ai_evidence_statuses(
         assert WebcamDetection.query.filter_by(session_id=session_id, status='POTENTIAL_MATCH').count() == 2
         session_record = WebcamSession.query.filter_by(session_id=session_id).first()
         assert session_record.faces_processed == 4
+
+
+def test_registered_face_reference_matches_webcam_with_small_image_changes(client):
+    user = create_user()
+    with client.session_transaction() as sess:
+        sess['user_id'] = user.id
+
+    reference = make_face_frame()
+    changed_frame = make_face_frame(offset=4, alpha=0.92, beta=10)
+    _, reference_jpeg = cv2.imencode('.jpg', reference)
+    _, changed_jpeg = cv2.imencode('.jpg', changed_frame)
+    reference_box = {'x': 45, 'y': 32, 'width': 110, 'height': 156}
+    changed_box = {'x': 49, 'y': 32, 'width': 110, 'height': 156}
+    upload_folder = tempfile.TemporaryDirectory()
+    previous_upload_folder = app.config['UPLOAD_FOLDER']
+    app.config['UPLOAD_FOLDER'] = upload_folder.name
+    try:
+        with patch('app.detect_multiple_faces', side_effect=[
+            [reference_box],
+            [changed_box],
+            [reference_box],
+        ]):
+            registered = client.post(
+                '/api/missing-persons',
+                data={
+                    'name': 'Reference Person',
+                    'last_seen_location': 'Test location',
+                    'photo': (BytesIO(reference_jpeg.tobytes()), 'reference.jpg'),
+                },
+                content_type='multipart/form-data',
+            )
+            assert registered.status_code == 201
+            person = registered.get_json()['person']
+            embedding = FaceEmbedding.query.filter_by(missing_person_id=person['id']).one()
+            assert embedding.embedding_dimension == 96 * 96
+
+            legacy_descriptor = np.ones(32 * 16, dtype=np.float32)
+            legacy_descriptor /= np.linalg.norm(legacy_descriptor)
+            embedding.embedding_vector = json.dumps(legacy_descriptor.tolist())
+            embedding.embedding_dimension = legacy_descriptor.size
+            db.session.commit()
+
+            started = client.post('/api/ai/webcam/start', json={})
+            assert started.status_code == 200
+            session_id = started.get_json()['session']['session_id']
+            result = client.post(
+                '/api/ai/webcam/process-frame',
+                data={
+                    'session_id': session_id,
+                    'frame': (BytesIO(changed_jpeg.tobytes()), 'changed-frame.jpg'),
+                },
+                content_type='multipart/form-data',
+            )
+            assert result.status_code == 200
+            face = result.get_json()['faces'][0]
+            assert face['status'] == 'POTENTIAL_MATCH'
+            assert face['case_id'] == person['case_id']
+            assert face['similarity_score'] >= 65
+            assert embedding.embedding_dimension == 96 * 96
+    finally:
+        app.config['UPLOAD_FOLDER'] = previous_upload_folder
+        upload_folder.cleanup()
 
 
 def test_face_quality_rejects_too_small_and_extremely_dark_faces():

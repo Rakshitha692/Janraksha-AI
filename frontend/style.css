@@ -5,6 +5,8 @@
 .safety-community-header i{font-size:1.15rem;color:#d64545}
 .safety-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:.9rem;margin-bottom:1rem}
 .safety-service-card{display:flex;align-items:center;gap:.8rem;padding:1rem;border-radius:14px;border:1px solid rgba(18,59,99,.08);background:#fff;box-shadow:0 6px 18px rgba(18,59,99,.04);min-height:92px}
+.safety-service-card{width:100%;text-align:left;font:inherit;cursor:pointer}
+.safety-service-card:hover,.safety-service-card:focus-visible{box-shadow:0 10px 22px rgba(18,59,99,.12);outline:2px solid rgba(30,90,138,.25);outline-offset:2px}
 .safety-service-icon{width:46px;height:46px;border-radius:12px;display:grid;place-items:center;color:#fff;flex-shrink:0}
 .safety-service-card.accident .safety-service-icon{background:linear-gradient(135deg,#f5b25f,#ef7d36)}
 .safety-service-card.fire .safety-service-icon{background:linear-gradient(135deg,#ff8a65,#e64d4d)}
@@ -18,6 +20,22 @@
 .emergency-call-btn{display:inline-flex;align-items:center;justify-content:center;min-height:46px;border-radius:12px;font-weight:700;padding:.75rem 1rem}
 .form-panel{margin-top:1.25rem;padding:1.2rem;border:1px solid rgba(18,59,99,.08);background:#fff;border-radius:14px;box-shadow:0 8px 18px rgba(18,59,99,.04)}
 .form-panel h4{display:flex;align-items:center;gap:.5rem;margin:0 0 .9rem;font-size:1.08rem;color:var(--navy)}
+.police-login-form{max-width:560px}
+.police-dashboard-actions{display:flex;align-items:center;justify-content:space-between;gap:1rem;margin-bottom:1rem}
+.police-stat-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:1rem;margin-bottom:1rem}
+.police-stat{display:flex;flex-direction:column;gap:.35rem;padding:1rem;background:#fff;border:1px solid #e8edf2;border-radius:12px}
+.police-stat small{color:var(--muted)}
+.police-stat strong{font-size:1.7rem;color:var(--navy)}
+.police-filters{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:.75rem;align-items:end;margin-bottom:1rem}
+.police-filters label{margin:0}
+.police-case-table{padding:1rem;overflow:hidden}
+.police-case-table th{white-space:nowrap;color:var(--navy)}
+.police-case-details{min-width:min(480px,75vw);padding:.9rem .25rem}
+.police-case-details p{overflow-wrap:anywhere}
+.police-case-update{display:grid;grid-template-columns:1fr 1fr auto;gap:.75rem;align-items:end}
+.police-case-update label{margin:0}
+.police-pagination{display:flex;flex-wrap:wrap;gap:.35rem}
+@media(max-width:700px){.police-stat-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.police-case-update{grid-template-columns:1fr}.police-dashboard-actions{align-items:flex-start;flex-direction:column}}
 .form-panel p{color:var(--muted);margin-bottom:1rem}
 .form-panel textarea,.form-panel input{border-radius:10px;border:1px solid rgba(18,59,99,.14);padding:.7rem .8rem}
 .result{display:flex;align-items:center;gap:.75rem;padding:.8rem .25rem;border-bottom:1px solid rgba(18,59,99,.08)}
