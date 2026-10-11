@@ -8,15 +8,15 @@ async function enablePhoneNotifications(button){const status=$('#phoneNotificati
 function showAuth(which){$('#authView').classList.remove('d-none');$('#loginModal').classList.toggle('d-none',which!=='login');$('#registerModal').classList.toggle('d-none',which!=='register')};function hideAuth(){$('#loginModal').classList.add('d-none');$('#registerModal').classList.add('d-none')}
 $('#loginForm').onsubmit=async e=>{e.preventDefault();try{let f=new FormData(e.target);await api('/api/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(Object.fromEntries(f))});boot()}catch(x){toast(x.message)}};
 $('#registerForm').onsubmit=async e=>{e.preventDefault();try{let f=new FormData(e.target),d=Object.fromEntries(f);d.terms=f.get('terms')==='on';await api('/api/auth/register',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)});boot()}catch(x){toast(x.message)}};
-async function boot(){try{me=(await api('/api/users/me')).user}catch{if(window.location.pathname==='/police'){me=null;$('#authView').classList.add('d-none');$('#appView').classList.remove('d-none');$('#userName').textContent='';$('#roleBadge').textContent='POLICE PORTAL';showPolicePortalShell();policePortal($('#page'))}return}$('#authView').classList.add('d-none');hideAuth();$('#appView').classList.remove('d-none');$('#userName').textContent=me.name;$('#roleBadge').textContent=me.role.replace('_',' ');if(window.location.pathname==='/police'){showPolicePortalShell();return policePortal($('#page'))}const matchMatch = window.location.pathname.match(/\/investigator\/matches\/(\d+)/);if(matchMatch && ['INVESTIGATOR','ADMIN_DEMO','FAMILY_USER','CITIZEN'].includes(me.role)){return openInvestigatorMatch(Number(matchMatch[1]));}go(new URLSearchParams(location.search).get('page')==='emergency'?'emergency':'dashboard')}
-document.querySelectorAll('.nav-link[data-page]').forEach(b=>b.onclick=()=>go(b.dataset.page));$('.logout').onclick=async()=>{await api('/api/auth/logout',{method:'POST'});location.reload()};
+async function boot(){try{me=(await api('/api/users/me')).user}catch{if(window.location.pathname==='/police'){me=null;$('#authView').classList.add('d-none');$('#appView').classList.remove('d-none');$('aside').classList.add('d-none');$('.workspace').style.marginLeft='0';$('#userName').textContent='';$('#roleBadge').textContent='POLICE PORTAL';policePortal($('#page'))}return}$('#authView').classList.add('d-none');hideAuth();$('#appView').classList.remove('d-none');$('#userName').textContent=me.name;$('#roleBadge').textContent=me.role.replace('_',' ');if(window.location.pathname==='/police'){if(['POLICE_OFFICER','ADMIN_DEMO'].includes(me.role)){showPolicePortalShell();return policePortal($('#page'))}$('aside').classList.add('d-none');$('.workspace').style.marginLeft='0';me=null;return policePortal($('#page'))}const matchMatch = window.location.pathname.match(/\/investigator\/matches\/(\d+)/);if(matchMatch && ['INVESTIGATOR','ADMIN_DEMO','FAMILY_USER','CITIZEN'].includes(me.role)){return openInvestigatorMatch(Number(matchMatch[1]));}go(new URLSearchParams(location.search).get('page')==='emergency'?'emergency':'dashboard')}
+document.querySelectorAll('.nav-link[data-page]').forEach(b=>b.onclick=()=>go(b.dataset.page));$('.logout').onclick=async()=>{await api(location.pathname==='/police'?'/api/police/logout':'/api/auth/logout',{method:'POST'});location.reload()};
 const heading=(t,s='')=>`<h1 class="page-title">${t}</h1><p class="page-subtitle">${s}</p>`;
-async function go(page){clearInterval(policeRefreshTimer);policeRefreshTimer=null;const activePage=['emergency','emergency-center'].includes(page)?'emergency-community':page;document.querySelectorAll('.nav-link').forEach(x=>x.classList.toggle('active',x.dataset.page===activePage));let el=$('#page');el.innerHTML='<div class="empty">Loading…</div>';try{if(page==='dashboard'){await dashboard(el);return}if(page==='cases'){await gallery(el);return}if(page==='register-case'){await caseForm(el);return}if(page==='search'){await search(el);return}if(page==='webcam'){await webcamSearch(el);return}if(page==='sighting'){await sightingForm(el);return}if(page==='found'){await foundForm(el);return}if(page==='notifications'){await notifications(el);return}if(page==='emergency'){await emergency(el,true);return}if(page==='emergency-community'){await emergency(el);return}if(page==='emergency-center'){await emergency(el,true);return}if(page==='police-portal'){await policePortal(el);return}}catch(e){el.innerHTML=`<div class="alert alert-danger">${escapeHtml(e.message)}</div>`}}
+async function go(page){clearInterval(policeRefreshTimer);policeRefreshTimer=null;const activePage=['emergency','emergency-center'].includes(page)?'emergency-community':page;document.querySelectorAll('.nav-link').forEach(x=>x.classList.toggle('active',x.dataset.page===activePage));let el=$('#page');el.innerHTML='<div class="empty">Loading…</div>';try{if(page==='dashboard'){if(location.pathname==='/police'&&me&&['POLICE_OFFICER','ADMIN_DEMO'].includes(me.role)){policeDashboard(el);return}await dashboard(el);return}if(page==='cases'){await gallery(el);return}if(page==='register-case'){await caseForm(el);return}if(page==='search'){await search(el);return}if(page==='webcam'){await webcamSearch(el);return}if(page==='sighting'){await sightingForm(el);return}if(page==='found'){await foundForm(el);return}if(page==='notifications'){await notifications(el);return}if(page==='emergency'){await emergency(el,true);return}if(page==='emergency-community'){await emergency(el);return}if(page==='emergency-center'){await emergency(el,true);return}if(page==='police-portal'){await policePortal(el);return}}catch(e){el.innerHTML=`<div class="alert alert-danger">${escapeHtml(e.message)}</div>`}}
 
 const webcamState={stream:null,active:false,starting:false,sessionId:null,processing:false,intervalId:null,facingMode:'user'};
 
 async function webcamSearch(el){
-  if (!['FAMILY_USER','CITIZEN','INVESTIGATOR','ADMIN_DEMO'].includes(me.role)) {
+  if (!['FAMILY_USER','CITIZEN','INVESTIGATOR','ADMIN_DEMO','POLICE_OFFICER'].includes(me.role)) {
     el.innerHTML = heading('Live webcam crowd detection', 'Sign in as a family member, citizen, investigator, or administrator to use your camera.') + '<div class="alert alert-warning">Your account does not currently have permission to access webcam matching.</div>';
     return;
   }
@@ -30,6 +30,22 @@ async function webcamSearch(el){
           <button class="btn btn-outline-primary" id="captureFrameBtn">Capture frame</button>
           <button class="btn btn-outline-primary" id="switchCameraBtn">Switch camera</button>
         </div>
+        <div class="webcam-source-tools mt-3">
+          <form id="webcamVideoScanForm" class="webcam-source-form">
+            <label>Upload a video
+              <input name="video" type="file" accept="video/*" required>
+            </label>
+            <button class="btn btn-outline-primary" type="submit">Scan video</button>
+            <small class="text-muted">Any video format supported by this server's OpenCV/FFmpeg installation.</small>
+          </form>
+          <form id="webcamUrlScanForm" class="webcam-source-form">
+            <label>Video or stream URL
+              <input name="stream_url" type="url" placeholder="https://example.com/video.mp4" required>
+            </label>
+            <button class="btn btn-outline-primary" type="submit">Scan video URL</button>
+            <small class="text-muted">Use a direct video or stream link supported by this server's OpenCV/FFmpeg installation.</small>
+          </form>
+        </div>
       </div>
       <div class="webcam-stage mt-3">
         <video id="webcamVideo" autoplay playsinline muted></video>
@@ -41,14 +57,106 @@ async function webcamSearch(el){
         <div><strong>Processing:</strong> <span id="processingStatus">Idle</span></div>
       </div>
       <div id="capturedFramePreview" class="captured-frame-preview d-none mt-3">
-        <strong>Last captured frame</strong>
-        <img alt="Most recently captured webcam frame" class="captured-frame-image">
+        <strong>Captured frame and highest similarity result</strong>
+        <div class="captured-frame-layout">
+          <div class="captured-frame-stage">
+            <img alt="Captured webcam frame with face detection boxes" class="captured-frame-image">
+            <div id="capturedFrameOverlay" class="face-overlay captured-face-overlay"></div>
+          </div>
+          <div id="capturedFrameMatch" class="captured-frame-match"></div>
+        </div>
       </div>
       <div id="webcamResults" class="webcam-results mt-3"></div>
     </div>
   `;
-  const video=$('#webcamVideo'); const overlay=$('#faceOverlay'); const statusEl=$('#cameraStatus'); const facesEl=$('#facesDetected'); const processEl=$('#processingStatus'); const resultsEl=$('#webcamResults'); const previewEl=$('#capturedFramePreview'); const previewImage=previewEl.querySelector('img'); const faceElements=new Map();
+  const video=$('#webcamVideo'); const overlay=$('#faceOverlay'); const statusEl=$('#cameraStatus'); const facesEl=$('#facesDetected'); const processEl=$('#processingStatus'); const resultsEl=$('#webcamResults'); const previewEl=$('#capturedFramePreview'); const previewImage=previewEl.querySelector('img'); const previewOverlay=$('#capturedFrameOverlay'); const capturedMatchEl=$('#capturedFrameMatch'); const faceElements=new Map();
+  let capturedFaces=[];
+  function renderCapturedFaceBoxes(faces=[]){
+    previewOverlay.replaceChildren();
+    if (!previewImage.naturalWidth || !previewImage.naturalHeight) return;
+    const overlayRect = previewOverlay.getBoundingClientRect();
+    const scaleX = overlayRect.width / previewImage.naturalWidth;
+    const scaleY = overlayRect.height / previewImage.naturalHeight;
+    const highestMatch = faces
+      .flatMap(face => (face.ranked_matches || []).map(match => ({face, score:Number(match.similarity_score) || 0})))
+      .sort((a, b) => b.score - a.score)[0];
+    faces.forEach((face, index) => {
+      const box = face.bbox || face;
+      const faceBox = document.createElement('div');
+      const isHighestMatch = highestMatch && highestMatch.face.face_id === face.face_id;
+      const statusClass = isHighestMatch ? 'potential' : face.ranked_matches?.length ? 'neutral' : face.status === 'NO_RELEVANT_MATCH' ? 'no-match' : face.status === 'INSUFFICIENT_QUALITY' ? 'warning' : 'neutral';
+      faceBox.className = `face-box ${statusClass}`;
+      faceBox.style.left = `${box.x * scaleX}px`;
+      faceBox.style.top = `${box.y * scaleY}px`;
+      faceBox.style.width = `${box.width * scaleX}px`;
+      faceBox.style.height = `${box.height * scaleY}px`;
+      const label = document.createElement('div');
+      label.className = 'face-label';
+      const score = (face.ranked_matches || []).reduce((best, match) => Math.max(best, Number(match.similarity_score) || 0), 0);
+      label.textContent = face.ranked_matches?.length ? `Face ${index + 1} · ${score.toFixed(1)}%` : `Face ${index + 1}`;
+      faceBox.appendChild(label);
+      previewOverlay.appendChild(faceBox);
+    });
+  }
+  previewImage.addEventListener('load', () => renderCapturedFaceBoxes(capturedFaces));
   const startButton=$('#startCameraBtn'); const stopButton=$('#stopCameraBtn'); const captureButton=$('#captureFrameBtn'); const switchButton=$('#switchCameraBtn');
+  async function submitVideoScan(form, useUrl=false){
+    const submitButton=form.querySelector('button[type="submit"]');
+    submitButton.disabled=true;
+    submitButton.textContent='Scanning…';
+    resultsEl.innerHTML='<div class="empty">Scanning sampled video frames for the highest similarity result…</div>';
+    try {
+      const response = useUrl
+        ? await api('/api/ai/webcam/process-video', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({stream_url:form.elements.stream_url.value.trim()})})
+        : await api('/api/ai/webcam/process-video', {method:'POST', body:new FormData(form)});
+      if (response.best_match && String(response.best_match.case?.status || '').toUpperCase().replaceAll(' ', '_') === 'CLOSED') {
+        response.best_match=null;
+        response.message='Closed cases are excluded from video matching.';
+      }
+      const summary=document.createElement('div');
+      summary.className='empty';
+      summary.textContent=`Scanned ${response.frames_analyzed} video frame${response.frames_analyzed === 1 ? '' : 's'}.`;
+      if (!response.best_match) {
+        resultsEl.replaceChildren(summary, Object.assign(document.createElement('div'), {className:'empty', textContent:response.message}));
+        return;
+      }
+      const result=document.createElement('div');
+      result.className='result webcam-result webcam-result-potential';
+      const note=document.createElement('p');
+      note.className='webcam-review-note';
+      note.textContent=`Highest similarity in the sampled frames at ${response.best_match.timestamp_seconds}s. Human verification is required; similarity is not proof of identity.`;
+      result.appendChild(note);
+      const matchContainer=document.createElement('div');
+      matchContainer.innerHTML=renderMatchGrid([response.best_match], false, null, true);
+      result.appendChild(matchContainer);
+      const verifyButton=matchContainer.querySelector('[data-webcam-verify]');
+      if (verifyButton) verifyButton.addEventListener('click', async ()=>{
+        verifyButton.disabled=true;
+        try {
+          let matchId=response.best_match.match_id;
+          if (!matchId) {
+            const review=await api(`/api/ai/webcam/session/${encodeURIComponent(response.session_id)}/review`, {
+              method:'POST', headers:{'Content-Type':'application/json'},
+              body:JSON.stringify({case_id:response.best_match.case.case_id, similarity_score:response.best_match.similarity_score})
+            });
+            matchId=review.match_id;
+          }
+          await openInvestigatorMatch(matchId);
+        } catch (error) {
+          toast(error.message || 'Could not open the verification form.');
+          verifyButton.disabled=false;
+        }
+      });
+      resultsEl.replaceChildren(summary, result);
+    } catch (error) {
+      resultsEl.innerHTML=`<div class="alert alert-danger">${escapeHtml(error.message || 'Video scan failed.')}</div>`;
+    } finally {
+      submitButton.disabled=false;
+      submitButton.textContent=useUrl ? 'Scan video URL' : 'Scan video';
+    }
+  }
+  $('#webcamVideoScanForm').addEventListener('submit', event=>{event.preventDefault(); void submitVideoScan(event.currentTarget);});
+  $('#webcamUrlScanForm').addEventListener('submit', event=>{event.preventDefault(); void submitVideoScan(event.currentTarget, true);});
   function updateStatus(label){ statusEl.textContent = label; }
   function setProcessing(label){ processEl.textContent = label; }
   function syncWebcamControls(){
@@ -59,6 +167,9 @@ async function webcamSearch(el){
   }
   function renderFaceBoxes(faces=[]){
     const activeFaceIds = new Set();
+    const highestMatch = faces
+      .flatMap(face => (face.ranked_matches || []).map(match => ({face, score:Number(match.similarity_score) || 0})))
+      .sort((a, b) => b.score - a.score)[0];
     const videoRect = video.getBoundingClientRect();
     const overlayRect = overlay.getBoundingClientRect();
     const sourceWidth = video.videoWidth || 640;
@@ -80,7 +191,8 @@ async function webcamSearch(el){
       const x = videoRect.left - overlayRect.left + offsetX + box.x * scale;
       const y = videoRect.top - overlayRect.top + offsetY + box.y * scale;
       const w = box.width * scale, h = box.height * scale;
-      const statusClass = result.status === 'POTENTIAL_MATCH' ? 'potential' : result.status === 'NO_RELEVANT_MATCH' ? 'no-match' : result.status === 'INSUFFICIENT_QUALITY' ? 'warning' : 'neutral';
+      const isHighestMatch = highestMatch && highestMatch.face.face_id === faceId;
+      const statusClass = isHighestMatch ? 'potential' : result.ranked_matches?.length ? 'neutral' : result.status === 'POTENTIAL_MATCH' ? 'potential' : result.status === 'NO_RELEVANT_MATCH' ? 'no-match' : result.status === 'INSUFFICIENT_QUALITY' ? 'warning' : 'neutral';
       faceBox.className = `face-box ${statusClass}`;
       faceBox.style.left = x + 'px'; faceBox.style.top = y + 'px'; faceBox.style.width = w + 'px'; faceBox.style.height = h + 'px';
       const label = document.createElement('div');
@@ -129,20 +241,28 @@ async function webcamSearch(el){
     const candidates = document.createElement('div');
     candidates.className = 'webcam-candidates';
     const hasRankedLeads = items.some(item => item.ranked_matches?.length);
+    if (hasRankedLeads) {
+      const highest = items
+        .flatMap(item => (item.ranked_matches || []).map(match => ({item, match})))
+        .sort((a, b) => Number(b.match.similarity_score || 0) - Number(a.match.similarity_score || 0))[0];
+      // Keep just one face and one case card: the highest score in this frame.
+      items = [{...highest.item, ranked_matches: [highest.match]}];
+    }
     items.forEach((item, index) => {
       const result = document.createElement('div');
       result.className = `result webcam-result${item.status === 'POTENTIAL_MATCH' ? ' webcam-result-potential' : ''}`;
       if (item.ranked_matches?.length) {
+        const topMatch = [...item.ranked_matches].sort((a, b) =>
+          Number(b.similarity_score || 0) - Number(a.similarity_score || 0)
+        )[0];
         const reviewNote = document.createElement('p');
         reviewNote.className = 'webcam-review-note';
         reviewNote.textContent = item.status === 'POTENTIAL_MATCH'
-          ? 'Human verification required. Similarity is not proof of identity.'
-          : 'Human review is required before drawing conclusions. This is a low-confidence similarity, not a confirmed match.';
+          ? 'Showing the highest similarity result. Human verification is required; similarity is not proof of identity.'
+          : 'Showing the highest similarity result for human review. This low-confidence similarity is not a confirmed match.';
         result.appendChild(reviewNote);
-        const similarityChart = renderWebcamSimilarityChart(item.ranked_matches);
-        result.appendChild(similarityChart);
         const rankedCards = document.createElement('div');
-        rankedCards.innerHTML = renderMatchGrid(item.ranked_matches, false, null, true);
+        rankedCards.innerHTML = renderMatchGrid([topMatch], false, null, true);
         result.appendChild(rankedCards);
         rankedCards.querySelectorAll('[data-webcam-verify]').forEach(verifyButton => {
           verifyButton.addEventListener('click', async () => {
@@ -222,6 +342,23 @@ async function webcamSearch(el){
     }));
     return faces;
   }
+  function removeClosedWebcamMatches(faces=[]){
+    const isClosed = status => String(status || '').toUpperCase().replaceAll(' ', '_') === 'CLOSED';
+    return faces.map(face=>{
+      const originalMatches=face.ranked_matches || [];
+      const openMatches=originalMatches.filter(match=>!isClosed(match.case?.status || match.person?.status));
+      const directClosed=isClosed(face.matched_person?.status)
+        || originalMatches.some(match=>isClosed(match.case?.status || match.person?.status));
+      if (openMatches.length) {
+        const best=openMatches.reduce((a,b)=>Number(a.similarity_score||0)>=Number(b.similarity_score||0)?a:b);
+        return {...face,ranked_matches:openMatches,case_id:best.case?.case_id||best.person?.case_id||face.case_id,similarity_score:best.similarity_score,match_id:best.match_id||null};
+      }
+      if (directClosed) {
+        return {...face,status:'NO_RELEVANT_MATCH',evidence_message:'Closed cases are excluded from webcam matching.',case_id:null,similarity_score:null,matched_person:null,match_id:null,ranked_matches:[],chart:null};
+      }
+      return {...face,ranked_matches:openMatches};
+    });
+  }
   async function processFrame({manual=false}={}){
     if (!webcamState.active || webcamState.processing || !video || !video.videoWidth) return;
     webcamState.processing = true; setProcessing(manual ? 'Capturing and analyzing frame…' : 'Active');
@@ -232,19 +369,39 @@ async function webcamSearch(el){
       if (!ctx) throw new Error('Could not prepare a webcam frame. Try reloading the page.');
       ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
       if (manual) {
-        previewImage.src = canvas.toDataURL('image/jpeg', 0.85);
+        capturedFaces = [];
+        previewOverlay.replaceChildren();
+        capturedMatchEl.textContent = 'Finding the highest similarity result…';
+        previewImage.src = canvas.toDataURL('image/jpeg', 0.95);
         previewEl.classList.remove('d-none');
       }
       const blob = await new Promise((resolve, reject) => {
-        canvas.toBlob(frame => frame ? resolve(frame) : reject(new Error('Could not capture a webcam frame.')), 'image/jpeg', 0.85);
+        // Keep the camera's native resolution and use a high JPEG quality so
+        // small facial details survive upload and server-side comparison.
+        canvas.toBlob(frame => frame ? resolve(frame) : reject(new Error('Could not capture a webcam frame.')), 'image/jpeg', 0.95);
       });
       const form = new FormData(); form.append('frame', blob, 'webcam-frame.jpg'); form.append('session_id', webcamState.sessionId);
       const data = await api('/api/ai/webcam/process-frame', {method:'POST', body:form});
       if (!webcamState.active) return;
-      const faces = await addFallbackWebcamMatches(data.faces || []);
+      const faces = removeClosedWebcamMatches(await addFallbackWebcamMatches(data.faces || []));
       renderFaceBoxes(faces);
+      if (manual) {
+        capturedFaces = faces;
+        renderCapturedFaceBoxes(capturedFaces);
+      }
       facesEl.textContent = String(data.faces_detected || 0);
       renderDetectionStatus(faces);
+      if (manual) {
+        const hasMatch = faces.some(face => face.ranked_matches?.length);
+        const visibleMatch = hasMatch ? resultsEl.querySelector('.webcam-result') : null;
+        if (visibleMatch) {
+          capturedMatchEl.replaceChildren(visibleMatch);
+        } else {
+          capturedMatchEl.textContent = faces.length
+            ? 'No similar registered person was found for this captured frame.'
+            : 'No face was detected in this captured frame.';
+        }
+      }
       if (manual) toast(faces.length ? 'Frame captured and analyzed.' : 'Frame captured. No face was detected. Try a clearer, well-lit view.');
     } catch (error) {
       toast(error.message || 'Webcam frame processing failed.');
@@ -264,9 +421,26 @@ async function webcamSearch(el){
     syncWebcamControls();
     let stream;
     try {
-      stream = await navigator.mediaDevices.getUserMedia({video:{facingMode:webcamState.facingMode || 'user'}, audio:false});
+      stream = await navigator.mediaDevices.getUserMedia({
+        video:{
+          facingMode:{ideal:webcamState.facingMode || 'user'},
+          width:{ideal:1280}, height:{ideal:720}, frameRate:{ideal:30, max:30}
+        },
+        audio:false
+      });
       video.srcObject = stream;
       await video.play();
+      // Ask supported cameras to keep focus on faces at changing distances.
+      const videoTrack = stream.getVideoTracks()[0];
+      if (videoTrack && videoTrack.getCapabilities && videoTrack.applyConstraints) {
+        const capabilities = videoTrack.getCapabilities();
+        const advanced = {};
+        if (capabilities.focusMode?.includes('continuous')) advanced.focusMode = 'continuous';
+        if (capabilities.exposureMode?.includes('continuous')) advanced.exposureMode = 'continuous';
+        if (Object.keys(advanced).length) {
+          try { await videoTrack.applyConstraints({advanced:[advanced]}); } catch (_) { /* camera controls are optional */ }
+        }
+      }
       const sessionData = await api('/api/ai/webcam/start', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({})});
       webcamState.stream = stream;
       webcamState.sessionId = sessionData.session.session_id;
@@ -374,8 +548,17 @@ async function reviewPotentialMatch(matchId, caseId){
 async function dashboard(el){let s=await api('/api/dashboard/statistics');let caseUpdate='';try{let casesList=(await api('/api/missing-persons')).items, foundCases=casesList.filter(p=>String(p.status).toUpperCase().replace(/ /g,'_')==='PERSON_FOUND');if(foundCases.length){caseUpdate=`<div class="panel"><h4>Case Update</h4><div class="alert-ai"><strong>🟢 Person Found</strong><br><div class="mt-2">Case ID: ${foundCases[0].case_id}</div><div class="mt-1">An authorized investigator has verified a potential match associated with your case.</div><div class="mt-3 d-flex gap-2"><button class="btn btn-primary btn-sm" onclick="viewCase(${foundCases[0].id})">View Case</button><button class="btn btn-outline-primary btn-sm" onclick="go('notifications')">View Timeline</button></div></div></div>`;}}catch(e){}el.innerHTML=heading('Good day, '+me.name.split(' ')[0],'A live overview of your authorized JanRaksha activity.')+`<div class="stat-grid"><div class="stat"><i class="fa-solid fa-folder-open"></i><small>Total cases</small><h2>${s.total_cases}</h2></div><div class="stat"><i class="fa-solid fa-person-circle-question"></i><small>Active cases</small><h2>${s.active_cases}</h2></div><div class="stat"><i class="fa-solid fa-eye"></i><small>New sightings</small><h2>${s.new_sightings}</h2></div><div class="stat"><i class="fa-solid fa-wand-magic-sparkles"></i><small>Potential matches</small><h2>${s.potential_matches}</h2></div></div>${caseUpdate}<div class="panel"><h4>Responsible AI</h4><div class="alert-ai">Similarity scores are AI-assisted leads only. They must never be treated as identity confirmation without authorized human review.</div></div><div class="panel"><h4>Quick actions</h4><button class="btn btn-primary btn-sm me-2" onclick="go('register-case')">Register a case</button><button class="btn btn-outline-primary btn-sm" onclick="go('search')">AI photo search</button></div>`}
 async function gallery(el){let r=await api('/api/missing-persons');cases=r.items;el.innerHTML=heading('Missing persons','Search authorized case records and follow active leads.')+`<input id="caseSearch" placeholder="Search by name, case ID or location"><div id="cards" class="case-grid mt-3"></div>`;let render=()=>{$('#cards').innerHTML=cases.filter(p=>(p.name+p.case_id+(p.last_seen_location||'')).toLowerCase().includes($('#caseSearch').value.toLowerCase())).map(card).join('')||'<div class="empty">No matching cases.</div>'};$('#caseSearch').oninput=render;render()}
 const card=p=>`<article class="case-card"><img src="${p.photo||''}" alt="Photo for ${p.name}"><div class="inner"><span class="badge-status">${p.status}</span><h4 class="mt-2">${p.name}</h4><small class="text-muted">${p.case_id} · ${p.age||'—'} years · ${p.gender||'—'}</small><p class="small mt-2 mb-2"><i class="fa-solid fa-location-dot"></i> ${p.last_seen_location||'Location restricted'}</p><button class="btn btn-outline-primary btn-sm" onclick="viewCase(${p.id})">View case</button></div></article>`;
-async function viewCase(id){let r=await api('/api/missing-persons/'+id),p=r.person;$('#page').innerHTML=heading(p.name,p.case_id)+`<div class="panel"><div class="row g-4"><div class="col-md-3"><img class="img-fluid rounded" src="${p.photo}" alt="${p.name}"></div><div class="col-md-9"><span class="badge-status">${String(p.status).replace(/_/g,' ')}</span><h4 class="mt-2">Last seen: ${p.last_seen_location||'Not shared'}</h4><p>${p.description||'No additional public description.'}</p>${['INVESTIGATOR','ADMIN_DEMO','FAMILY_USER','CITIZEN'].includes(me.role)?`<select id="status"><option>${String(p.status).replace(/_/g,' ')}</option><option>ACTIVE</option><option>UNDER REVIEW</option><option>RELEVANT LEAD</option><option>PERSON FOUND</option><option>PERSON_FOUND</option><option>CLOSED</option></select><button class="btn btn-primary btn-sm mt-2" onclick="updateStatus(${p.id})">Update status</button><textarea id="note" placeholder="Restricted investigation note"></textarea><button class="btn btn-outline-primary btn-sm mt-2" onclick="addNote('${p.case_id}')">Add note</button>`:''}</div></div></div><div class="panel"><h4>Investigation timeline</h4><div class="timeline">${r.timeline.map(x=>`<div class="event"><b>${x.event_type.replaceAll('_',' ')}</b><br><span class="text-muted small">${new Date(x.created_at).toLocaleString()} · ${x.description}</span></div>`).join('')||'No events yet.'}</div></div>`}
-async function updateStatus(id){try{await api('/api/missing-persons/'+id,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({status:$('#status').value})});toast('Case status updated.');viewCase(id)}catch(e){toast(e.message)}}async function addNote(caseId){try{await api('/api/cases/'+caseId+'/notes',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({body:$('#note').value})});toast('Restricted note added.')}catch(e){toast(e.message)}}
+async function viewCase(id){
+  let r=await api('/api/missing-persons/'+id),p=r.person;
+  const canSetPersonFound=['INVESTIGATOR','ADMIN_DEMO'].includes(me.role);
+  const isPersonFound=['PERSON_FOUND','PERSON FOUND'].includes(p.status);
+  const foundStatusOption=canSetPersonFound?`<option value="PERSON_FOUND" ${isPersonFound?'selected':''}>PERSON FOUND (verified)</option>`:isPersonFound?'<option value="PERSON_FOUND" selected disabled>PERSON FOUND (verified)</option>':'';
+  const statusControl=r.permissions?.can_update_status?`<label for="status">Update case status</label><select id="status"><option value="ACTIVE" ${p.status==='ACTIVE'?'selected':''}>ACTIVE</option><option value="UNDER REVIEW" ${p.status==='UNDER REVIEW'?'selected':''}>UNDER REVIEW</option><option value="RELEVANT LEAD" ${p.status==='RELEVANT LEAD'?'selected':''}>RELEVANT LEAD</option><option value="CLOSED" ${p.status==='CLOSED'?'selected':''}>CLOSED</option>${foundStatusOption}</select><button class="btn btn-primary btn-sm mt-2" onclick="updateStatus(${p.id})">Update status</button>${['FAMILY_USER','POLICE_OFFICER'].includes(me.role)?'<p class="small text-muted mt-2">You can update case progress. An investigator must verify a person-found status.</p>':''}`:'';
+  const noteControls=r.permissions?.can_add_notes?`<textarea id="note" placeholder="Restricted investigation note"></textarea><button class="btn btn-outline-primary btn-sm mt-2" onclick="addNote('${p.case_id}')">Add note</button>`:'';
+  $('#page').innerHTML=heading(p.name,p.case_id)+`<div class="panel"><div class="row g-4"><div class="col-md-3"><img class="img-fluid rounded" src="${p.photo}" alt="${p.name}"></div><div class="col-md-9"><span class="badge-status">${String(p.status).replace(/_/g,' ')}</span><h4 class="mt-2">Last seen: ${p.last_seen_location||'Not shared'}</h4><p>${p.description||'No additional public description.'}</p>${statusControl}${noteControls}</div></div></div><div class="panel"><h4>Investigation timeline</h4><div class="timeline">${r.timeline.map(x=>`<div class="event"><b>${x.event_type.replaceAll('_',' ')}</b><br><span class="text-muted small">${new Date(x.created_at).toLocaleString()} · ${x.description}</span></div>`).join('')||'No events yet.'}</div></div>`
+}
+async function updateStatus(id){try{await api('/api/missing-persons/'+id,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({status:$('#status').value})});toast('Case status updated.');viewCase(id)}catch(e){toast(e.message)}}
+async function addNote(caseId){try{await api('/api/cases/'+caseId+'/notes',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({body:$('#note').value})});toast('Restricted note added.')}catch(e){toast(e.message)}}
 
 async function openInvestigatorMatch(matchId){
   try {
@@ -504,8 +687,8 @@ async function openInvestigatorMatch(matchId){
 }
 
 function personFields(){return `<label>Full name<input name="name" required></label><div class="row"><div class="col"><label>Age<input name="age" type="number" min="0"></label></div><div class="col"><label>Gender<select name="gender"><option>Not specified</option><option>Female</option><option>Male</option><option>Other</option></select></label></div></div><label>Photograph<div class="drop"><i class="fa-solid fa-cloud-arrow-up"></i> JPG or PNG, max 5 MB<input name="photo" type="file" accept="image/png,image/jpeg" required></div></label>`}
-function caseForm(el){if(!['FAMILY_USER','INVESTIGATOR','ADMIN_DEMO'].includes(me.role)){el.innerHTML=heading('Register missing person')+'<div class="alert alert-warning">Your role cannot register cases.</div>';return}el.innerHTML=heading('Register missing person','Create a secure case. The system will create the case ID and embedding.')+`<form id="caseForm" class="panel form-panel">${personFields()}<label>Last-seen location<input name="last_seen_location" required></label><div class="row"><div class="col"><label>Date<input name="last_seen_date" type="date"></label></div><div class="col"><label>Time<input name="last_seen_time" type="time"></label></div></div><label>Description<textarea name="description"></textarea></label><label>Clothing description<textarea name="clothing_description"></textarea></label><button class="btn btn-primary">Create case and process photo</button></form>`;$('#caseForm').onsubmit=e=>submitForm(e,'/api/missing-persons',r=>{toast(r.message);viewCase(r.person.id)})}
-function renderMatchGrid(matches, isFound=false, reportId=null, isWebcam=false){if(!matches.length){return '<div class="empty">No potential matches found.</div>'}const ranked=matches.map(match=>({item:match.case||match.person||match,score:Number(match.similarity_score)||0,matchId:match.match_id})).sort((a,b)=>b.score-a.score);return `<div class="match-comparison">${ranked.map(({item,score,matchId},index)=>{const percent=Math.min(100,Math.max(0,score));const label=Number.isInteger(score)?score:score.toFixed(1);const action=isFound?`<div class="match-actions"><input id="verifyLocation-${item.case_id}" class="mb-2" placeholder="Verified location" value="${document.querySelector('#foundForm input[name=\'location_name\']')?.value||''}"><div class="d-flex gap-2"><button class="btn btn-sm btn-primary" onclick="verifyFoundReport(${reportId}, '${item.case_id}', true)">Yes, verified</button><button class="btn btn-sm btn-outline-secondary" onclick="verifyFoundReport(${reportId}, '${item.case_id}', false)">No, not this person</button></div></div>`:isWebcam?(['INVESTIGATOR','ADMIN_DEMO','FAMILY_USER','CITIZEN'].includes(me.role)?`<button type="button" class="btn btn-sm btn-outline-primary" data-webcam-verify data-case-id="${item.case_id}">Verify this match</button>`:'<span class="webcam-review-note">Requires authorized human review</span>'):`<button class="btn btn-link btn-sm p-0" onclick="viewCase(${item.id})">View case</button>`;const caseDetails=isWebcam?`${item.age??'—'} yrs · ${item.last_seen_location||'Location not shared'}`:`${item.case_id||''} · ${item.age??'—'} yrs · ${item.last_seen_location||'Location not shared'}`;const badge=isWebcam&&matchId?'HUMAN VERIFICATION REQUIRED':isWebcam&&item.status==='LOW_CONFIDENCE_LEAD'?'LOW CONFIDENCE · HUMAN REVIEW REQUIRED':item.status||'POTENTIAL MATCH';return `<article class="match-row"><div class="match-rank" aria-label="Rank ${index+1}">${index+1}</div><img class="match-photo" src="${item.photo||''}" alt="Photo for ${item.name||'potential match'}"><div class="match-details"><div class="match-heading"><div><h5>${item.name||'Unknown person'}</h5><small>${caseDetails}</small></div><strong class="score-pill">${label}%</strong></div><div class="score-panel"><div class="score-labels"><span>Similarity score</span><strong>${label}%</strong></div><div class="score-bar" role="meter" aria-label="Similarity score" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${percent}"><span class="score-fill" style="width:${percent}%"></span></div></div><div class="match-footer"><span class="badge-status">${badge}</span>${action}</div></div></article>`}).join('')}</div>`;}
+function caseForm(el){if(!['FAMILY_USER','INVESTIGATOR','ADMIN_DEMO','POLICE_OFFICER'].includes(me.role)){el.innerHTML=heading('Register missing person')+'<div class="alert alert-warning">Your role cannot register cases.</div>';return}el.innerHTML=heading('Register missing person','Create a secure case. The system will create the case ID and embedding.')+`<form id="caseForm" class="panel form-panel">${personFields()}<label>Last-seen location<input name="last_seen_location" required></label><div class="row"><div class="col"><label>Date<input name="last_seen_date" type="date"></label></div><div class="col"><label>Time<input name="last_seen_time" type="time"></label></div></div><label>Description<textarea name="description"></textarea></label><label>Clothing description<textarea name="clothing_description"></textarea></label><button class="btn btn-primary">Create case and process photo</button></form>`;$('#caseForm').onsubmit=e=>submitForm(e,'/api/missing-persons',r=>{toast(r.message);viewCase(r.person.id)})}
+function renderMatchGrid(matches, isFound=false, reportId=null, isWebcam=false){if(!matches.length){return '<div class="empty">No potential matches found.</div>'}const ranked=matches.map(match=>({item:match.case||match.person||match,score:Number(match.similarity_score)||0,matchId:match.match_id})).sort((a,b)=>b.score-a.score);return `<div class="match-comparison">${ranked.map(({item,score,matchId},index)=>{const percent=Math.min(100,Math.max(0,score));const label=Number.isInteger(score)?score:score.toFixed(1);const action=isFound?`<div class="match-actions"><input id="verifyLocation-${item.case_id}" class="mb-2" placeholder="Verified location" value="${document.querySelector('#foundForm input[name=\'location_name\']')?.value||''}"><div class="d-flex gap-2"><button class="btn btn-sm btn-primary" onclick="verifyFoundReport(${reportId}, '${item.case_id}', true)">Yes, verified</button><button class="btn btn-sm btn-outline-secondary" onclick="verifyFoundReport(${reportId}, '${item.case_id}', false)">No, not this person</button></div></div>`:isWebcam?(['INVESTIGATOR','ADMIN_DEMO','FAMILY_USER','CITIZEN','POLICE_OFFICER'].includes(me.role)?`<button type="button" class="btn btn-sm btn-outline-primary" data-webcam-verify data-case-id="${item.case_id}">Verify this match</button>`:'<span class="webcam-review-note">Requires authorized human review</span>'):`<button class="btn btn-link btn-sm p-0" onclick="viewCase(${item.id})">View case</button>`;const caseDetails=isWebcam?`${item.age??'—'} yrs · ${item.last_seen_location||'Location not shared'}`:`${item.case_id||''} · ${item.age??'—'} yrs · ${item.last_seen_location||'Location not shared'}`;const badge=isWebcam&&matchId?'HUMAN VERIFICATION REQUIRED':isWebcam&&item.status==='LOW_CONFIDENCE_LEAD'?'LOW CONFIDENCE · HUMAN REVIEW REQUIRED':item.status||'POTENTIAL MATCH';return `<article class="match-row"><div class="match-rank" aria-label="Rank ${index+1}">${index+1}</div><img class="match-photo" src="${item.photo||''}" alt="Photo for ${item.name||'potential match'}"><div class="match-details"><div class="match-heading"><div><h5>${item.name||'Unknown person'}</h5><small>${caseDetails}</small></div><strong class="score-pill">${label}%</strong></div><div class="score-panel"><div class="score-labels"><span>Similarity score</span><strong>${label}%</strong></div><div class="score-bar" role="meter" aria-label="Similarity score" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${percent}"><span class="score-fill" style="width:${percent}%"></span></div></div><div class="match-footer"><span class="badge-status">${badge}</span>${action}</div></div></article>`}).join('')}</div>`;}
 function search(el){el.innerHTML=heading('AI photo search','Upload a photo to search authorized missing-person embeddings.')+`<div class="alert-ai">AI-generated results are potential leads and require human verification. A similarity score is not an identity decision.</div><form id="searchForm" class="panel form-panel"><label>Query photograph<input name="photo" type="file" accept="image/png,image/jpeg" required></label><label>Exclude existing case ID (optional)<input name="exclude_case_id" placeholder="JR-2026-0001"></label><button class="btn btn-primary">Process and search</button></form><div id="results"></div>`;$('#searchForm').onsubmit=e=>submitForm(e,'/api/ai/search',r=>{$('#results').innerHTML=`<div class="panel"><h4>Ranked potential matches</h4><p class="small text-muted">Sorted by AI similarity score. Results are leads, not identity confirmation.</p>${r.chart?`<img class="match-chart" src="${r.chart}" alt="Seaborn chart comparing similarity scores by case">`:''}${renderMatchGrid(r.matches, false)}</div>`})}
 function sightingForm(el){el.innerHTML=heading('Report a sighting','Submit a lead for authorized review. Location details are access controlled.')+`<form id="sightingForm" class="panel form-panel"><label>Related case ID<input name="case_id" placeholder="JR-2026-0001" required></label><label>Photo (optional)<input name="photo" type="file" accept="image/png,image/jpeg"></label><label>Description<textarea name="description" required></textarea></label><label>Location name<input name="location_name" required></label><button class="btn btn-primary">Submit sighting</button></form>`;$('#sightingForm').onsubmit=e=>submitForm(e,'/api/sightings',r=>toast(r.message))}
 function foundForm(el){el.innerHTML=heading('Report found person','This creates an AI-assisted lead only. Citizens cannot mark a case as found without human verification.')+`<form id="foundForm" class="panel form-panel"><label>Photograph<input name="photo" type="file" accept="image/png,image/jpeg" required></label><label>Exclude existing case ID (optional)<input name="exclude_case_id" placeholder="JR-2026-0001"></label><label>Description<textarea name="description"></textarea></label><label>Current location<input name="location_name" required></label><button class="btn btn-primary">Submit and find potential matches</button></form><div id="foundResults"></div>`;$('#foundForm').onsubmit=e=>submitForm(e,'/api/found-persons',r=>{$('#foundResults').innerHTML=`<div class="panel"><h4>Ranked potential matches</h4><p class="small text-muted">A human must confirm the match before any email alert is sent.</p>${r.chart?`<img class="match-chart" src="${r.chart}" alt="Seaborn chart comparing similarity scores by case">`:''}${renderMatchGrid(r.matches, true, r.report_id)}</div>`;toast(r.message)})}
@@ -568,9 +751,19 @@ async function emergency(el, centerOnly=false){
     if(admin)$('#contactForm').onsubmit=e=>{e.preventDefault();api('/api/emergency-contacts',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(Object.fromEntries(new FormData(e.target)))}).then(()=>{toast('Safety contact saved.');refreshCurrent()}).catch(x=>toast(x.message))};
   }
 }function showPolicePortalShell(){
+  $('aside').classList.remove('d-none');
+  $('.workspace').style.marginLeft='';
+  const policePages=new Set(['dashboard','cases','register-case','search','webcam']);
   document.querySelectorAll('aside .nav-link').forEach(item=>{
-    if(item.dataset.page!=='police-portal')item.classList.add('d-none');
+    item.classList.toggle('d-none',!policePages.has(item.dataset.page)&&!item.classList.contains('logout'));
   });
+  const labels={dashboard:'Emergency cases',cases:'Registered missing persons','register-case':'Register missing person',search:'AI search',webcam:'Live webcam'};
+  document.querySelectorAll('aside .nav-link[data-page]').forEach(item=>{
+    if(labels[item.dataset.page])item.lastChild.textContent=labels[item.dataset.page];
+  });
+  const logout=$('.logout');
+  logout.innerHTML='<i class="fa-solid fa-arrow-right-from-bracket"></i>Police Portal logout';
+  logout.onclick=async()=>{try{await api('/api/police/logout',{method:'POST'});location.reload()}catch(error){toast(error.message)}};
 }
 
 function policePortal(el){
@@ -589,12 +782,11 @@ function policePortal(el){
 
 function policeDashboard(el){
   el.innerHTML=heading('Police Portal','Emergency case management · refreshes automatically every 20 seconds.')+
-    `<div class="police-dashboard-actions"><span class="badge-status">Signed in as ${escapeHtml(me.name)}</span><button id="policeLogout" class="btn btn-outline-secondary btn-sm">Police Portal logout</button></div>
+    `<div class="police-dashboard-actions"><span class="badge-status">Signed in as ${escapeHtml(me.name)}</span></div>
     <div id="policeCaseSummary" class="police-stat-grid"></div>
     <form id="policeCaseFilters" class="panel police-filters"><label>Search case ID or description<input name="search" placeholder="Search cases"></label><label>Category<select name="category"><option value="">All categories</option>${[['ACCIDENT','Accident'],['FIRE','Fire'],['MEDICAL','Medical'],['POLICE','Police'],['WOMEN_SAFETY','Women Safety'],['CHILD_SAFETY','Child Safety']].map(([value,label])=>`<option value="${value}">${label}</option>`).join('')}</select></label><label>Status<select name="status"><option value="">All statuses</option><option value="PENDING">Pending</option><option value="IN_PROGRESS">In Progress</option><option value="RESOLVED">Resolved</option></select></label><label>From date<input type="date" name="from_date"></label><label>To date<input type="date" name="to_date"></label><button class="btn btn-primary btn-sm" type="submit">Apply filters</button><button class="btn btn-outline-secondary btn-sm" type="reset">Clear</button></form>
     <div id="policeCasesContainer"><div class="empty">Loading emergency cases…</div></div>
     ${me.role==='ADMIN_DEMO'?`<form id="policeOfficerForm" class="panel form-panel"><h4>Create police officer account</h4><p>For authorized administrators only. The password is hashed on the server and never returned.</p><label>Police ID<input name="police_id" maxlength="40" required></label><label>Officer name<input name="name" maxlength="120" required></label><label>Registered email<input name="email" type="email" maxlength="160" required></label><label>Contact phone<input name="phone"></label><label>Temporary password (at least 8 characters)<input name="password" type="password" minlength="8" autocomplete="new-password" required></label><div id="policeOfficerMessage" role="status"></div><button class="btn btn-primary" type="submit">Create police account</button></form>`:''}`;
-  $('#policeLogout').onclick=async()=>{try{await api('/api/police/logout',{method:'POST'});location.reload()}catch(error){toast(error.message)}};
   $('#policeCaseFilters').onsubmit=event=>{event.preventDefault();loadPoliceCases(el,1)};
   $('#policeCaseFilters').onreset=()=>setTimeout(()=>loadPoliceCases(el,1),0);
   if(me.role==='ADMIN_DEMO')$('#policeOfficerForm').onsubmit=async event=>{

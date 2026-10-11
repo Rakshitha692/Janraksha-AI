@@ -41,6 +41,15 @@
 .webcam-match-photo { width: 82px; height: 96px; flex: 0 0 82px; object-fit: cover; border-radius: 8px; background: #edf2f7; }
 .webcam-match-details { display: grid; gap: 4px; }
 .webcam-review-note { color: #52677c; font-size: .9rem; }
-.captured-frame-preview { display: grid; gap: 8px; width: min(100%, 480px); }
+.webcam-source-tools { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 1rem; }
+.webcam-source-form { display: grid; align-content: start; gap: .45rem; padding: 1rem; border: 1px solid #dce4eb; border-radius: 10px; background: #f8fafc; }
+.webcam-source-form label { margin: 0; }
+.webcam-source-form small { display: block; }
+.captured-frame-preview { display: grid; gap: 8px; width: 100%; }
+.captured-frame-layout { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); align-items: start; gap: 1rem; }
+.captured-frame-stage { position: relative; width: 100%; }
 .captured-frame-image { display: block; width: 100%; max-height: 320px; object-fit: contain; border: 1px solid #d8e4ee; border-radius: 10px; background: #101820; }
+.captured-frame-match { min-width: 0; color: #52677c; }
+.captured-frame-match .webcam-result { display: block; width: 100%; margin: 0; }
 @media (max-width: 480px) { .webcam-match-card { align-items: flex-start; gap: 10px; } .webcam-match-photo { width: 68px; height: 80px; flex-basis: 68px; } }
+@media (max-width: 760px) { .captured-frame-layout { grid-template-columns: 1fr; } }

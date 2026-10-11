@@ -1,7 +1,10 @@
 import os, uuid, base64, smtplib, json, re
 import hashlib
+import ipaddress
+import socket
 from urllib.parse import urlsplit
 from threading import Lock
+import time
 from email.message import EmailMessage
 from datetime import datetime, date, timedelta
 from functools import wraps
@@ -370,17 +373,58 @@ def detect_multiple_faces(frame_path):
         raise ValueError('The webcam frame could not be read.')
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     gray = cv2.equalizeHist(gray)
-    cascade = _safe_haar_cascade('haarcascade_frontalface_default.xml')
-    if cascade is None:
+    frontal_cascade = _safe_haar_cascade('haarcascade_frontalface_default.xml')
+    frontal_alt_cascade = _safe_haar_cascade('haarcascade_frontalface_alt2.xml')
+    if frontal_cascade is None and frontal_alt_cascade is None:
         version = getattr(cv2, '__version__', 'unknown')
         raise ValueError(
             f'Face scanning requires OpenCV 4.x with Haar support (detected OpenCV {version}). '
             r'Run JanRaksha with .venv\Scripts\python.exe after installing requirements.txt.'
         )
-    faces = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=4, minSize=(32, 32))
-    if len(faces) == 0:
-        return []
-    return [{'x': int(x), 'y': int(y), 'width': int(w), 'height': int(h)} for x, y, w, h in sorted(faces, key=lambda item: item[2] * item[3], reverse=True)]
+    detected = []
+    # Run two frontal Haar models: the alternate model often finds faces at
+    # slightly different lighting/expressions. Profile models below cover
+    # side views. The overlap pass merges duplicate boxes from these models.
+    for cascade in (frontal_cascade, frontal_alt_cascade):
+        if cascade is None:
+            continue
+        frontal = cascade.detectMultiScale(
+            gray, scaleFactor=1.08, minNeighbors=5, minSize=(40, 40)
+        )
+        detected.extend((int(x), int(y), int(w), int(h)) for x, y, w, h in frontal)
+
+    # Haar profile models cover side views; flip the image to detect profiles
+    # facing the other direction, then map those boxes back to frame coordinates.
+    profile_cascade = _safe_haar_cascade('haarcascade_profileface.xml')
+    if profile_cascade is not None:
+        for profile_gray, mirrored in ((gray, False), (cv2.flip(gray, 1), True)):
+            profiles = profile_cascade.detectMultiScale(
+                profile_gray, scaleFactor=1.1, minNeighbors=4, minSize=(32, 32)
+            )
+            for x, y, width, height in profiles:
+                x, y, width, height = int(x), int(y), int(width), int(height)
+                if mirrored:
+                    x = gray.shape[1] - x - width
+                detected.append((x, y, width, height))
+
+    # Merge overlapping frontal/profile detections so one face gets one box.
+    unique = []
+    for x, y, width, height in sorted(detected, key=lambda box: box[2] * box[3], reverse=True):
+        duplicate = False
+        for ux, uy, uw, uh in unique:
+            intersection_width = max(0, min(x + width, ux + uw) - max(x, ux))
+            intersection_height = max(0, min(y + height, uy + uh) - max(y, uy))
+            intersection = intersection_width * intersection_height
+            union = width * height + uw * uh - intersection
+            if union and intersection / union >= 0.35:
+                duplicate = True
+                break
+        if not duplicate:
+            unique.append((x, y, width, height))
+    return [
+        {'x': x, 'y': y, 'width': width, 'height': height}
+        for x, y, width, height in unique
+    ]
 
 
 def _expanded_face_crop(image, face):
@@ -582,6 +626,20 @@ def cache_webcam_face_result(session_id, face_id, result):
             track['last_processed'] = datetime.utcnow()
 
 
+def invalidate_webcam_case_cache(case_id):
+    with webcam_tracks_lock:
+        for state in webcam_tracks.values():
+            for track in state.get('faces', {}).values():
+                cached = track.get('result') or {}
+                candidate_ids = {cached.get('case_id')}
+                candidate_ids.update(
+                    (match.get('case') or {}).get('case_id')
+                    for match in cached.get('ranked_matches', [])
+                )
+                if case_id in candidate_ids:
+                    track['result'] = None
+
+
 def generate_embedding(face_path):
     image = cv2.imread(face_path) if isinstance(face_path, str) else face_path
     if image is None:
@@ -602,7 +660,7 @@ def search_missing_persons(embedding, source_type=None, source_id=None, similari
     grouped = {}
     for row in FaceEmbedding.query.all():
         person = db.session.get(MissingPerson, row.missing_person_id)
-        if not person:
+        if not person or normalize_case_status(person.status) == 'CLOSED':
             continue
         stored = np.array(json.loads(row.embedding_vector), dtype=np.float32)
         if stored.size != vector.size:
@@ -634,7 +692,8 @@ def search_missing_persons(embedding, source_type=None, source_id=None, similari
     for entry in grouped.values():
         if entry['best_evidence'] >= 80 or include_low_confidence:
             results.append({'person': entry['person'], 'similarity': round(entry['best_similarity'], 1), 'combined_score': round(entry['best_evidence'], 1)})
-    results.sort(key=lambda item: item['combined_score'], reverse=True)
+    rank_key = 'similarity' if source_type == 'WEBCAM' else 'combined_score'
+    results.sort(key=lambda item: item[rank_key], reverse=True)
     results = results[:10]
     if record_matches:
         for result in results:
@@ -963,14 +1022,14 @@ def can_review_match(match):
         return False
     if user.role in {'INVESTIGATOR', 'ADMIN_DEMO'}:
         return True
-    if user.role not in {'FAMILY_USER', 'CITIZEN'} or match.source_type != 'WEBCAM':
+    if user.role not in {'FAMILY_USER', 'CITIZEN', 'POLICE_OFFICER'} or match.source_type != 'WEBCAM':
         return False
     session_record = db.session.get(WebcamSession, match.source_id)
     return bool(session_record and can_access_webcam_session(session_record))
 
 
 @app.post('/api/ai/webcam/start')
-@require_auth({'FAMILY_USER', 'CITIZEN', 'INVESTIGATOR', 'ADMIN_DEMO'})
+@require_auth({'FAMILY_USER', 'CITIZEN', 'INVESTIGATOR', 'ADMIN_DEMO', 'POLICE_OFFICER'})
 def webcam_start():
     payload = request.get_json(silent=True) or {}
     session_record = WebcamSession(
@@ -994,7 +1053,7 @@ def webcam_start():
 
 
 @app.post('/api/ai/webcam/process-frame')
-@require_auth({'FAMILY_USER', 'CITIZEN', 'INVESTIGATOR', 'ADMIN_DEMO'})
+@require_auth({'FAMILY_USER', 'CITIZEN', 'INVESTIGATOR', 'ADMIN_DEMO', 'POLICE_OFFICER'})
 def webcam_process_frame():
     session_id = (request.form.get('session_id') or '').strip() or (request.get_json(silent=True) or {}).get('session_id')
     if not session_id:
@@ -1021,6 +1080,10 @@ def webcam_process_frame():
         for index, (face, (face_id, cached_result)) in enumerate(zip(faces, assignments), start=1):
             raw_crop = None
             bbox = {'x': face['x'], 'y': face['y'], 'width': face['width'], 'height': face['height']}
+            if cached_result and cached_result.get('case_id'):
+                cached_person = MissingPerson.query.filter_by(case_id=cached_result['case_id']).first()
+                if not cached_person or normalize_case_status(cached_person.status) == 'CLOSED':
+                    cached_result = None
             if cached_result is not None:
                 face_results.append({**cached_result, 'bbox': bbox, 'index': index, 'label': 'Face ' + str(index)})
                 continue
@@ -1055,17 +1118,18 @@ def webcam_process_frame():
                         include_low_confidence=True,
                     )
                     if matches:
-                        best = matches[0]
+                        best = max(matches, key=lambda candidate: candidate['similarity'])
                         similarity_score = float(best['similarity'])
                         matched_person = best['person']
                         case_id = matched_person.case_id
                         status = 'POTENTIAL_MATCH' if best.get('combined_score', 0.0) >= 80 else 'NO_RELEVANT_MATCH'
                         match_chart = match_chart_data(matches)
-                        for candidate in matches:
+                        # A webcam frame should expose only its highest-scoring case.
+                        # Lower-ranked registered people add noise and are not useful
+                        # for the live review flow.
+                        for candidate in (best,):
                             person = candidate['person']
                             candidate_match = None
-                            # Keep every ranked lead reviewable, including lower-confidence leads;
-                            # the reviewer sees the score and decides whether it is relevant.
                             if normalize_case_status(person.status) != 'PERSON_FOUND':
                                 # One review item per case per webcam session; frame polling must not
                                 # create a new investigator task every few seconds.
@@ -1154,8 +1218,174 @@ def webcam_process_frame():
             app.logger.warning('Could not remove temporary webcam image: %s', file_path)
 
 
+def _process_video_frame(session_id, user_id, frame):
+    success, encoded = cv2.imencode('.jpg', frame)
+    if not success:
+        return None
+    with app.test_request_context(
+        '/api/ai/webcam/process-frame',
+        method='POST',
+        data={
+            'session_id': session_id,
+            'frame': (BytesIO(encoded.tobytes()), 'video-frame.jpg'),
+        },
+        content_type='multipart/form-data',
+    ):
+        session['user_id'] = user_id
+        response = webcam_process_frame.__wrapped__()
+        if isinstance(response, tuple):
+            response = response[0]
+        return response.get_json()
+
+
+def _scan_video_capture(capture, session_record, is_live_stream=False):
+    user_id = current_user().id
+    fps = float(capture.get(cv2.CAP_PROP_FPS) or 0)
+    frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    duration = frame_count / fps if fps > 0 and frame_count > 0 else 0
+    max_seconds = max(10, int(os.environ.get('MAX_VIDEO_SCAN_SECONDS', '120')))
+    max_samples = max(1, min(60, int(os.environ.get('MAX_VIDEO_SAMPLE_FRAMES', '24'))))
+    if is_live_stream:
+        positions = [None] * min(max_samples, 10)
+    elif duration > 0:
+        scan_duration = min(duration, max_seconds)
+        sample_count = min(max_samples, max(1, int(scan_duration / 2) + 1))
+        positions = [int((scan_duration * index / max(1, sample_count - 1)) * 1000) for index in range(sample_count)]
+    else:
+        positions = [None] * max_samples
+
+    best_match = None
+    samples_processed = 0
+    for timestamp_ms in positions:
+        if timestamp_ms is not None:
+            capture.set(cv2.CAP_PROP_POS_MSEC, timestamp_ms)
+        elif is_live_stream and samples_processed:
+            time.sleep(1)
+        ok, frame = capture.read()
+        if not ok or frame is None:
+            if timestamp_ms is not None:
+                continue
+            break
+        samples_processed += 1
+        # Analyze each sampled image independently instead of reusing a cached
+        # webcam track result from an earlier moment in the clip.
+        with webcam_tracks_lock:
+            webcam_tracks.pop(session_record.session_id, None)
+        result = _process_video_frame(session_record.session_id, user_id, frame)
+        if not result:
+            continue
+        for face in result.get('faces', []):
+            for candidate in face.get('ranked_matches', []):
+                score = float(candidate.get('similarity_score') or 0)
+                if best_match is None or score > best_match['similarity_score']:
+                    best_match = {
+                        **candidate,
+                        'similarity_score': score,
+                        'timestamp_seconds': round(timestamp_ms / 1000, 1) if timestamp_ms is not None else samples_processed - 1,
+                        'face_bbox': face.get('bbox'),
+                    }
+    return {'best_match': best_match, 'frames_analyzed': samples_processed}
+
+
+@app.post('/api/ai/webcam/process-video')
+@require_auth({'FAMILY_USER', 'CITIZEN', 'INVESTIGATOR', 'ADMIN_DEMO', 'POLICE_OFFICER'})
+def webcam_process_video():
+    request.max_content_length = int(os.environ.get('MAX_VIDEO_UPLOAD_MB', '100')) * 1024 * 1024
+    video_file = request.files.get('video')
+    payload = request.get_json(silent=True) or {}
+    stream_url = (request.form.get('stream_url') or payload.get('stream_url') or '').strip()
+    if not video_file and not stream_url:
+        return api_error('Upload a video file or provide a video/stream URL.', 400)
+
+    session_record = WebcamSession(
+        session_id=next_webcam_session_id(),
+        investigator_id=current_user().id,
+        monitoring_description='Uploaded video or video stream review',
+        status='ACTIVE',
+    )
+    db.session.add(session_record)
+    db.session.commit()
+
+    capture = None
+    temp_path = None
+    try:
+        if stream_url:
+            try:
+                parsed = urlsplit(stream_url)
+            except ValueError:
+                return api_error('Enter a valid video/stream URL.', 400)
+            host = (parsed.hostname or '').lower()
+            scheme = parsed.scheme.lower()
+            if scheme not in {'http', 'https', 'rtsp', 'rtsps'} or not host:
+                return api_error('Use a direct HTTP, HTTPS, RTSP, or RTSPS video/stream URL.', 400)
+            try:
+                port = parsed.port or {'http': 80, 'https': 443, 'rtsp': 554, 'rtsps': 322}[scheme]
+                try:
+                    resolved_addresses = {ipaddress.ip_address(host)}
+                except ValueError:
+                    resolved_addresses = {
+                        ipaddress.ip_address(address[4][0])
+                        for address in socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+                    }
+            except (ValueError, OSError):
+                return api_error('The video URL has an invalid or unreachable host.', 400)
+            if not resolved_addresses or any(not address.is_global for address in resolved_addresses):
+                return api_error('Video URLs must point to a publicly reachable host.', 403)
+            try:
+                capture = cv2.VideoCapture(
+                    stream_url,
+                    cv2.CAP_FFMPEG,
+                    [cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 5000, cv2.CAP_PROP_READ_TIMEOUT_MSEC, 5000],
+                )
+            except (TypeError, cv2.error):
+                capture = cv2.VideoCapture(stream_url)
+            is_live_stream = True
+        else:
+            if not video_file.filename:
+                return api_error('Choose a video file to scan.', 400)
+            # Accept any filename extension; OpenCV/FFmpeg validates the actual
+            # container and codec when it opens and reads the uploaded file.
+            extension = os.path.splitext(secure_filename(video_file.filename))[1].lower() or '.mp4'
+            os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+            temp_path = os.path.join(app.config['UPLOAD_FOLDER'], f'webcam_video_{uuid.uuid4().hex}{extension}')
+            video_file.save(temp_path)
+            capture = cv2.VideoCapture(temp_path)
+            is_live_stream = False
+
+        if not capture or not capture.isOpened():
+            return api_error('The video could not be decoded. Use a format and codec supported by this server\'s OpenCV/FFmpeg installation.', 400)
+        scan = _scan_video_capture(capture, session_record, is_live_stream)
+        if scan['frames_analyzed'] == 0:
+            return api_error('No readable video frames were found. Try another video format or codec.', 400)
+        session_record.status = 'STOPPED'
+        session_record.ended_at = datetime.utcnow()
+        db.session.commit()
+        return jsonify(
+            success=True,
+            session_id=session_record.session_id,
+            frames_analyzed=scan['frames_analyzed'],
+            best_match=scan['best_match'],
+            message='Video scan completed.' if scan['best_match'] else 'No similar registered person was found in the sampled frames.',
+        )
+    except (ValueError, cv2.error) as exc:
+        db.session.rollback()
+        return api_error(str(exc) or 'The video could not be analyzed.', 400)
+    finally:
+        if capture is not None:
+            capture.release()
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError:
+                app.logger.warning('Could not remove temporary webcam video: %s', temp_path)
+        if session_record.status == 'ACTIVE':
+            session_record.status = 'STOPPED'
+            session_record.ended_at = datetime.utcnow()
+            db.session.commit()
+
+
 @app.post('/api/ai/webcam/stop')
-@require_auth({'FAMILY_USER', 'CITIZEN', 'INVESTIGATOR', 'ADMIN_DEMO'})
+@require_auth({'FAMILY_USER', 'CITIZEN', 'INVESTIGATOR', 'ADMIN_DEMO', 'POLICE_OFFICER'})
 def webcam_stop():
     payload = request.get_json(silent=True) or {}
     session_id = (payload.get('session_id') or request.form.get('session_id') or '').strip()
@@ -1171,7 +1401,7 @@ def webcam_stop():
 
 
 @app.get('/api/ai/webcam/session/<session_id>')
-@require_auth({'FAMILY_USER', 'CITIZEN', 'INVESTIGATOR', 'ADMIN_DEMO'})
+@require_auth({'FAMILY_USER', 'CITIZEN', 'INVESTIGATOR', 'ADMIN_DEMO', 'POLICE_OFFICER'})
 def webcam_session_details(session_id):
     session_record = WebcamSession.query.filter_by(session_id=session_id).first()
     if not session_record:
@@ -1193,7 +1423,7 @@ def webcam_session_details(session_id):
 
 
 @app.get('/api/ai/webcam/session/<session_id>/matches')
-@require_auth({'FAMILY_USER', 'CITIZEN', 'INVESTIGATOR', 'ADMIN_DEMO'})
+@require_auth({'FAMILY_USER', 'CITIZEN', 'INVESTIGATOR', 'ADMIN_DEMO', 'POLICE_OFFICER'})
 def webcam_session_matches(session_id):
     session_record = WebcamSession.query.filter_by(session_id=session_id).first()
     if not session_record:
@@ -1214,7 +1444,7 @@ def webcam_session_matches(session_id):
 
 
 @app.post('/api/ai/webcam/session/<session_id>/review')
-@require_auth({'FAMILY_USER', 'CITIZEN', 'INVESTIGATOR', 'ADMIN_DEMO'})
+@require_auth({'FAMILY_USER', 'CITIZEN', 'INVESTIGATOR', 'ADMIN_DEMO', 'POLICE_OFFICER'})
 def create_webcam_review(session_id):
     session_record = WebcamSession.query.filter_by(session_id=session_id).first()
     if not session_record:
@@ -1265,7 +1495,7 @@ def list_people():
 
 
 @app.post('/api/missing-persons')
-@require_auth({'FAMILY_USER', 'INVESTIGATOR', 'ADMIN_DEMO'})
+@require_auth({'FAMILY_USER', 'INVESTIGATOR', 'ADMIN_DEMO', 'POLICE_OFFICER'})
 def create_person():
     photo = None
     try:
@@ -1296,20 +1526,36 @@ def get_person(pid):
     p = db.session.get(MissingPerson, pid)
     if not p:
         return api_error('Case not found.', 404)
-    return jsonify(person=person_json(p), timeline=[{'event_type': x.event_type, 'description': x.description, 'created_at': x.created_at.isoformat()} for x in Timeline.query.filter_by(case_id=p.case_id).order_by(Timeline.created_at.desc())], notes=[{'body': x.body, 'created_at': x.created_at.isoformat()} for x in InvestigationNote.query.filter_by(case_id=p.case_id).all()])
+    viewer = current_user()
+    can_update_status = bool(
+        viewer.role in {'INVESTIGATOR', 'ADMIN_DEMO', 'POLICE_OFFICER', 'FAMILY_USER'}
+    )
+    can_add_notes = viewer.role in {'INVESTIGATOR', 'ADMIN_DEMO'}
+    return jsonify(
+        person=person_json(p),
+        timeline=[{'event_type': x.event_type, 'description': x.description, 'created_at': x.created_at.isoformat()} for x in Timeline.query.filter_by(case_id=p.case_id).order_by(Timeline.created_at.desc())],
+        notes=[{'body': x.body, 'created_at': x.created_at.isoformat()} for x in InvestigationNote.query.filter_by(case_id=p.case_id).all()],
+        permissions={'can_update_status': can_update_status, 'can_add_notes': can_add_notes},
+    )
 
 
 @app.put('/api/missing-persons/<int:pid>')
-@require_auth({'INVESTIGATOR', 'ADMIN_DEMO'})
+@require_auth({'INVESTIGATOR', 'ADMIN_DEMO', 'POLICE_OFFICER', 'FAMILY_USER'})
 def update_person(pid):
     p = db.session.get(MissingPerson, pid); d = request.get_json() or {}
     if not p:
         return api_error('Case not found.', 404)
+    user = current_user()
     if d.get('status') not in CASE_STATUSES:
         return api_error('Invalid case status.')
+    if user.role in {'FAMILY_USER', 'POLICE_OFFICER'} and normalize_case_status(d['status']) == 'PERSON_FOUND':
+        return api_error('A person-found status requires authorized investigator verification.', 403)
     p.status = d['status']; add_timeline(p.case_id, 'STATUS_UPDATED', f'Case status updated to {display_case_status(p.status)}.', current_user().id)
     notify_case(p.case_id, 'Case status updated', f'{p.case_id} is now {display_case_status(p.status)}.')
-    db.session.commit(); return jsonify(person=person_json(p))
+    db.session.commit()
+    if normalize_case_status(p.status) == 'CLOSED':
+        invalidate_webcam_case_cache(p.case_id)
+    return jsonify(person=person_json(p))
 
 
 @app.post('/api/ai/search')
