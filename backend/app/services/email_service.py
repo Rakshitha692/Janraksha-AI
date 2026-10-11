@@ -9,12 +9,13 @@ def _mail_config():
     username = os.environ.get('MAIL_USERNAME') or os.environ.get('SMTP_USER') or ''
     password = os.environ.get('MAIL_PASSWORD') or os.environ.get('SMTP_PASSWORD') or ''
     use_tls = str(os.environ.get('MAIL_USE_TLS', os.environ.get('SMTP_TLS', 'true'))).lower() in {'1', 'true', 'yes', 'on'}
+    use_ssl = str(os.environ.get('MAIL_USE_SSL', 'false')).lower() in {'1', 'true', 'yes', 'on'}
     sender = os.environ.get('MAIL_DEFAULT_SENDER') or os.environ.get('SMTP_FROM') or 'JanRaksha AI <noreply@janraksha.local>'
-    return server, port, username, password, use_tls, sender
+    return server, port, username, password, use_tls, use_ssl, sender
 
 
 def _send_email_message(recipient_email, subject, html_body, text_body=None):
-    server, port, username, password, use_tls, sender = _mail_config()
+    server, port, username, password, use_tls, use_ssl, sender = _mail_config()
     if not recipient_email or not server or not sender:
         raise RuntimeError('SMTP configuration missing.')
     text_body = text_body or 'JanRaksha AI notification.'
@@ -24,8 +25,9 @@ def _send_email_message(recipient_email, subject, html_body, text_body=None):
     message['To'] = recipient_email
     message.set_content(text_body)
     message.add_alternative(html_body, subtype='html')
-    with smtplib.SMTP(server, port, timeout=10) as client:
-        if use_tls:
+    smtp_client = smtplib.SMTP_SSL if use_ssl else smtplib.SMTP
+    with smtp_client(server, port, timeout=10) as client:
+        if use_tls and not use_ssl:
             client.starttls()
         if username:
             client.login(username, password)

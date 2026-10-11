@@ -1,5 +1,8 @@
 .env
 .env.*
 !.env.example
+private_key.pem
 __pycache__/
 *.pyc
+
+public_key.pem

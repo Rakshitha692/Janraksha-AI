@@ -22,3 +22,25 @@
   letter-spacing: 0.02em;
   white-space: nowrap;
 }
+.webcam-result-potential { border-left: 4px solid #1f9d61; }
+.webcam-results { display: block; }
+.webcam-candidates { display: grid; gap: 1rem; }
+.webcam-results .webcam-result { display: block; width: 100%; padding: 1rem; border: 1px solid #dce4eb; border-radius: 10px; background: #fff; }
+.webcam-results .webcam-ranked-title { margin: 0 0 .4rem; color: #123b63; font-size: 1.1rem; }
+.webcam-results .match-comparison { display: grid; gap: .8rem; }
+.webcam-results .match-photo { width: 5rem; height: 5rem; }
+.webcam-results .match-chart { max-width: 100%; }
+.webcam-similarity-chart { display: grid; gap: .55rem; margin: .85rem 0 1rem; padding: 1rem; border: 1px solid #dce4eb; border-radius: 10px; background: #fff; }
+.webcam-similarity-chart h5 { margin: 0 0 .2rem; text-align: center; color: #123b63; font-size: 1rem; }
+.webcam-chart-row { display: grid; grid-template-columns: 4.5rem minmax(2rem,1fr) 3.5rem; align-items: center; gap: .6rem; font-size: .85rem; }
+.webcam-chart-row strong { text-align: right; }
+.webcam-chart-track { height: 1rem; overflow: hidden; background: #e9eef3; border-radius: 999px; }
+.webcam-chart-track span { display: block; height: 100%; border-radius: inherit; background: linear-gradient(90deg,#198754,#91bd43); }
+.webcam-verify-below { display: inline-block; margin-top: .9rem; }
+.webcam-match-card { display: flex; align-items: center; gap: 14px; margin-top: 12px; padding: 12px; border: 1px solid #d8e4ee; border-radius: 10px; background: #fff; }
+.webcam-match-photo { width: 82px; height: 96px; flex: 0 0 82px; object-fit: cover; border-radius: 8px; background: #edf2f7; }
+.webcam-match-details { display: grid; gap: 4px; }
+.webcam-review-note { color: #52677c; font-size: .9rem; }
+.captured-frame-preview { display: grid; gap: 8px; width: min(100%, 480px); }
+.captured-frame-image { display: block; width: 100%; max-height: 320px; object-fit: contain; border: 1px solid #d8e4ee; border-radius: 10px; background: #101820; }
+@media (max-width: 480px) { .webcam-match-card { align-items: flex-start; gap: 10px; } .webcam-match-photo { width: 68px; height: 80px; flex-basis: 68px; } }

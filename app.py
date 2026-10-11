@@ -1,4 +1,6 @@
-import os, uuid, base64, smtplib, json, math, re
+import os, uuid, base64, smtplib, json, re
+import hashlib
+from urllib.parse import urlsplit
 from threading import Lock
 from email.message import EmailMessage
 from datetime import datetime, date, timedelta
@@ -12,12 +14,40 @@ from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
+from pywebpush import webpush, WebPushException
 
 from backend.app.services.email_service import (
     send_verified_match_email,
     send_case_update_email,
     send_notification_email,
 )
+
+def load_local_env():
+    """Load simple KEY=VALUE settings from the project .env without external packages."""
+    env_path = os.path.join(os.path.dirname(__file__), '.env')
+    try:
+        with open(env_path, encoding='utf-8') as env_file:
+            for raw_line in env_file:
+                line = raw_line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                if line.startswith('export '):
+                    line = line[7:].lstrip()
+                key, separator, value = line.partition('=')
+                key = key.strip()
+                if not separator or not key:
+                    continue
+                value = value.strip()
+                if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+                    value = value[1:-1]
+                else:
+                    value = value.split(' #', 1)[0].strip()
+                os.environ.setdefault(key, value)
+    except FileNotFoundError:
+        pass
+
+
+load_local_env()
 
 app = Flask(__name__, static_folder='frontend', static_url_path='')
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'development-only-change-me')
@@ -30,7 +60,11 @@ app.config['MAIL_PORT'] = int(os.environ.get('MAIL_PORT', os.environ.get('SMTP_P
 app.config['MAIL_USERNAME'] = os.environ.get('MAIL_USERNAME') or os.environ.get('SMTP_USER') or ''
 app.config['MAIL_PASSWORD'] = os.environ.get('MAIL_PASSWORD') or os.environ.get('SMTP_PASSWORD') or ''
 app.config['MAIL_USE_TLS'] = str(os.environ.get('MAIL_USE_TLS', os.environ.get('SMTP_TLS', 'true'))).lower() in {'1', 'true', 'yes', 'on'}
+app.config['MAIL_USE_SSL'] = str(os.environ.get('MAIL_USE_SSL', 'false')).lower() in {'1', 'true', 'yes', 'on'}
 app.config['MAIL_DEFAULT_SENDER'] = os.environ.get('MAIL_DEFAULT_SENDER') or os.environ.get('SMTP_FROM') or 'JanRaksha AI <noreply@janraksha.local>'
+app.config['VAPID_PUBLIC_KEY'] = os.environ.get('VAPID_PUBLIC_KEY', '')
+app.config['VAPID_PRIVATE_KEY'] = os.environ.get('VAPID_PRIVATE_KEY', '')
+app.config['VAPID_SUBJECT'] = os.environ.get('VAPID_SUBJECT', 'mailto:admin@example.com')
 app.config['POTENTIAL_MATCH_THRESHOLD'] = float(os.environ.get('POTENTIAL_MATCH_THRESHOLD', '0.80'))
 if not 0 <= app.config['POTENTIAL_MATCH_THRESHOLD'] <= 1:
     raise ValueError('POTENTIAL_MATCH_THRESHOLD must be between 0 and 1.')
@@ -59,7 +93,7 @@ class MissingPerson(db.Model):
     registered_by = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False); name = db.Column(db.String(120), nullable=False)
     age = db.Column(db.Integer); gender = db.Column(db.String(30)); photo = db.Column(db.String(255))
     description = db.Column(db.Text); clothing_description = db.Column(db.Text); last_seen_location = db.Column(db.String(200))
-    latitude = db.Column(db.Float); longitude = db.Column(db.Float); last_seen_date = db.Column(db.Date)
+    last_seen_date = db.Column(db.Date)
     last_seen_time = db.Column(db.String(10)); status = db.Column(db.String(30), default='ACTIVE'); created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
 
@@ -70,13 +104,13 @@ class FaceEmbedding(db.Model):
 
 class Sighting(db.Model):
     id = db.Column(db.Integer, primary_key=True); case_id = db.Column(db.String(20)); reported_by = db.Column(db.Integer, db.ForeignKey('user.id'))
-    photo = db.Column(db.String(255)); description = db.Column(db.Text); location_name = db.Column(db.String(200)); latitude = db.Column(db.Float); longitude = db.Column(db.Float)
+    photo = db.Column(db.String(255)); description = db.Column(db.Text); location_name = db.Column(db.String(200))
     reported_at = db.Column(db.DateTime, default=datetime.utcnow); status = db.Column(db.String(30), default='SUBMITTED')
 
 
 class FoundPerson(db.Model):
     id = db.Column(db.Integer, primary_key=True); reported_by = db.Column(db.Integer, db.ForeignKey('user.id'))
-    photo = db.Column(db.String(255)); description = db.Column(db.Text); location_name = db.Column(db.String(200)); latitude = db.Column(db.Float); longitude = db.Column(db.Float)
+    photo = db.Column(db.String(255)); description = db.Column(db.Text); location_name = db.Column(db.String(200))
     found_date = db.Column(db.Date); status = db.Column(db.String(30), default='SUBMITTED'); matched_case_id = db.Column(db.String(20)); verification_status = db.Column(db.String(30), default='PENDING_HUMAN_REVIEW')
     verified_by = db.Column(db.Integer, db.ForeignKey('user.id')); verified_at = db.Column(db.DateTime); verified_location = db.Column(db.String(200)); verified_found = db.Column(db.Boolean, default=False)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
@@ -137,8 +171,6 @@ class WebcamSession(db.Model):
     session_id = db.Column(db.String(40), unique=True, nullable=False, index=True)
     investigator_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False, index=True)
     location_name = db.Column(db.String(200))
-    latitude = db.Column(db.Float)
-    longitude = db.Column(db.Float)
     monitoring_description = db.Column(db.Text)
     started_at = db.Column(db.DateTime, default=datetime.utcnow)
     ended_at = db.Column(db.DateTime)
@@ -172,8 +204,17 @@ class TrustedContact(db.Model):
 
 class EmergencyEvent(db.Model):
     id = db.Column(db.Integer, primary_key=True); user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False, index=True)
-    status = db.Column(db.String(20), default='ACTIVE'); latitude = db.Column(db.Float); longitude = db.Column(db.Float)
+    status = db.Column(db.String(20), default='ACTIVE')
     location_name = db.Column(db.String(200)); message = db.Column(db.Text); created_at = db.Column(db.DateTime, default=datetime.utcnow); cancelled_at = db.Column(db.DateTime)
+
+
+class PushSubscription(db.Model):
+    __tablename__ = 'push_subscriptions'
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False, index=True)
+    endpoint_hash = db.Column(db.String(64), nullable=False, unique=True)
+    subscription_json = db.Column(db.Text, nullable=False)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
 
 
 class PoliceOfficer(db.Model):
@@ -196,8 +237,6 @@ class EmergencyCase(db.Model):
     reporter_contact = db.Column(db.String(160))
     description = db.Column(db.Text, nullable=False)
     location_name = db.Column(db.String(200), nullable=False)
-    latitude = db.Column(db.Float)
-    longitude = db.Column(db.Float)
     attachment = db.Column(db.String(255))
     status = db.Column(db.String(20), nullable=False, default='PENDING', index=True)
     assigned_officer_id = db.Column(db.Integer, db.ForeignKey('user.id'), index=True)
@@ -255,7 +294,7 @@ def user_json(u):
 def person_json(p):
     return {'id': p.id, 'case_id': p.case_id, 'name': p.name, 'age': p.age, 'gender': p.gender, 'photo': p.photo,
             'description': p.description, 'clothing_description': p.clothing_description, 'last_seen_location': p.last_seen_location,
-            'latitude': p.latitude, 'longitude': p.longitude, 'last_seen_date': p.last_seen_date.isoformat() if p.last_seen_date else None,
+            'last_seen_date': p.last_seen_date.isoformat() if p.last_seen_date else None,
             'last_seen_time': p.last_seen_time, 'status': p.status, 'created_at': p.created_at.isoformat()}
 
 
@@ -669,8 +708,9 @@ def send_email(recipient, subject, message):
         return False
     try:
         email = EmailMessage(); email['Subject'] = subject; email['From'] = sender; email['To'] = recipient; email.set_content(message)
-        with smtplib.SMTP(host, int(app.config.get('MAIL_PORT') or os.environ.get('SMTP_PORT', '587')), timeout=10) as client:
-            if app.config.get('MAIL_USE_TLS') or str(os.environ.get('SMTP_TLS', 'true')).lower() in {'1', 'true', 'yes', 'on'}:
+        smtp_client = smtplib.SMTP_SSL if app.config.get('MAIL_USE_SSL') else smtplib.SMTP
+        with smtp_client(host, int(app.config.get('MAIL_PORT') or os.environ.get('SMTP_PORT', '587')), timeout=10) as client:
+            if not app.config.get('MAIL_USE_SSL') and (app.config.get('MAIL_USE_TLS') or str(os.environ.get('SMTP_TLS', 'true')).lower() in {'1', 'true', 'yes', 'on'}):
                 client.starttls()
             if username:
                 client.login(username, password or '')
@@ -679,6 +719,38 @@ def send_email(recipient, subject, message):
     except Exception:
         app.logger.warning('Could not deliver email alert.', exc_info=True)
         return False
+
+
+def send_web_push(user_ids, title, message, url='/?page=emergency'):
+    private_key = app.config.get('VAPID_PRIVATE_KEY')
+    if not app.config.get('VAPID_PUBLIC_KEY') or not private_key:
+        return {'configured': False, 'sent': 0, 'total': 0}
+    subscriptions = PushSubscription.query.filter(PushSubscription.user_id.in_(set(user_ids))).all() if user_ids else []
+    payload = json.dumps({'title': title, 'body': message, 'url': url})
+    sent = 0
+    stale = []
+    for subscription in subscriptions:
+        try:
+            webpush(
+                subscription_info=json.loads(subscription.subscription_json),
+                data=payload,
+                vapid_private_key=private_key,
+                vapid_claims={'sub': app.config['VAPID_SUBJECT']},
+                ttl=300,
+            )
+            sent += 1
+        except WebPushException as exc:
+            response = getattr(exc, 'response', None)
+            if response is not None and response.status_code in (404, 410):
+                stale.append(subscription)
+            app.logger.warning('Could not deliver a phone push notification (HTTP %s).', getattr(response, 'status_code', 'unknown'))
+        except Exception:
+            app.logger.warning('Could not deliver a phone push notification.', exc_info=True)
+    for subscription in stale:
+        db.session.delete(subscription)
+    if stale:
+        db.session.commit()
+    return {'configured': True, 'sent': sent, 'total': len(subscriptions)}
 
 
 def send_case_email(case_id, subject, message):
@@ -818,6 +890,57 @@ def me():
     return jsonify(user=user_json(current_user()))
 
 
+@app.get('/api/push/public-key')
+@require_auth()
+def push_public_key():
+    if not app.config.get('VAPID_PUBLIC_KEY') or not app.config.get('VAPID_PRIVATE_KEY'):
+        return api_error('Phone notifications are not configured on the server yet.', 503)
+    return jsonify(public_key=app.config['VAPID_PUBLIC_KEY'])
+
+
+@app.post('/api/push/subscription')
+@require_auth()
+def save_push_subscription():
+    if not app.config.get('VAPID_PUBLIC_KEY') or not app.config.get('VAPID_PRIVATE_KEY'):
+        return api_error('Phone notifications are not configured on the server yet.', 503)
+    subscription = request.get_json(silent=True) or {}
+    if not isinstance(subscription, dict):
+        return api_error('Invalid phone notification subscription.')
+    endpoint = subscription.get('endpoint')
+    keys = subscription.get('keys') or {}
+    try:
+        host = urlsplit(endpoint).hostname.lower() if isinstance(endpoint, str) and endpoint.startswith('https://') else ''
+    except ValueError:
+        host = ''
+    allowed_hosts = {'fcm.googleapis.com', 'web.push.apple.com'}
+    allowed_suffixes = ('.push.services.mozilla.com', '.notify.windows.com', '.push.samsungosp.com')
+    if not isinstance(endpoint, str) or not endpoint or len(endpoint) > 4096 or not (host in allowed_hosts or host.endswith(allowed_suffixes)) or not isinstance(keys, dict) or not isinstance(keys.get('p256dh'), str) or not isinstance(keys.get('auth'), str):
+        return api_error('Invalid phone notification subscription.')
+    endpoint_hash = hashlib.sha256(endpoint.encode('utf-8')).hexdigest()
+    row = PushSubscription.query.filter_by(endpoint_hash=endpoint_hash).first()
+    if row:
+        row.user_id = current_user().id
+        row.subscription_json = json.dumps(subscription)
+    else:
+        db.session.add(PushSubscription(user_id=current_user().id, endpoint_hash=endpoint_hash, subscription_json=json.dumps(subscription)))
+    db.session.commit()
+    return jsonify(message='Phone notifications enabled on this device.'), 201
+
+
+@app.delete('/api/push/subscription')
+@require_auth()
+def delete_push_subscription():
+    subscription = request.get_json(silent=True) or {}
+    endpoint = subscription.get('endpoint') if isinstance(subscription, dict) else None
+    if isinstance(endpoint, str):
+        endpoint_hash = hashlib.sha256(endpoint.encode('utf-8')).hexdigest()
+        row = PushSubscription.query.filter_by(endpoint_hash=endpoint_hash, user_id=current_user().id).first()
+        if row:
+            db.session.delete(row)
+            db.session.commit()
+    return jsonify(message='Phone notification subscription removed.')
+
+
 @app.get('/webcam-search')
 def webcam_search_page():
     return send_app_index()
@@ -834,6 +957,18 @@ def can_access_webcam_session(session_record):
     )
 
 
+def can_review_match(match):
+    user = current_user()
+    if not user:
+        return False
+    if user.role in {'INVESTIGATOR', 'ADMIN_DEMO'}:
+        return True
+    if user.role not in {'FAMILY_USER', 'CITIZEN'} or match.source_type != 'WEBCAM':
+        return False
+    session_record = db.session.get(WebcamSession, match.source_id)
+    return bool(session_record and can_access_webcam_session(session_record))
+
+
 @app.post('/api/ai/webcam/start')
 @require_auth({'FAMILY_USER', 'CITIZEN', 'INVESTIGATOR', 'ADMIN_DEMO'})
 def webcam_start():
@@ -842,8 +977,6 @@ def webcam_start():
         session_id=next_webcam_session_id(),
         investigator_id=current_user().id,
         location_name=(payload.get('location_name') or '').strip() or None,
-        latitude=float(payload['latitude']) if payload.get('latitude') not in (None, '') else None,
-        longitude=float(payload['longitude']) if payload.get('longitude') not in (None, '') else None,
         monitoring_description=(payload.get('monitoring_description') or '').strip() or None,
         status='ACTIVE',
     )
@@ -854,8 +987,6 @@ def webcam_start():
         'session_id': session_record.session_id,
         'investigator_id': session_record.investigator_id,
         'location_name': session_record.location_name,
-        'latitude': session_record.latitude,
-        'longitude': session_record.longitude,
         'monitoring_description': session_record.monitoring_description,
         'status': session_record.status,
         'started_at': session_record.started_at.isoformat(),
@@ -887,9 +1018,12 @@ def webcam_process_frame():
         faces = detect_multiple_faces(file_path)
         assignments = assign_webcam_face_tracks(session_record.session_id, faces)
         face_results = []
-        for index, (face, (face_id, _)) in enumerate(zip(faces, assignments), start=1):
+        for index, (face, (face_id, cached_result)) in enumerate(zip(faces, assignments), start=1):
             raw_crop = None
             bbox = {'x': face['x'], 'y': face['y'], 'width': face['width'], 'height': face['height']}
+            if cached_result is not None:
+                face_results.append({**cached_result, 'bbox': bbox, 'index': index, 'label': 'Face ' + str(index)})
+                continue
             try:
                 image = cv2.imread(file_path)
                 if image is not None:
@@ -901,6 +1035,10 @@ def webcam_process_frame():
             evidence_message = 'AI Evidence Indicator: no relevant match in the current reference set.'
             similarity_score = None
             case_id = None
+            matched_person = None
+            match_id = None
+            ranked_candidates = []
+            match_chart = None
             if raw_crop is not None and raw_crop.size:
                 quality = _face_quality_metrics(raw_crop)
                 if not quality['ok']:
@@ -919,8 +1057,40 @@ def webcam_process_frame():
                     if matches:
                         best = matches[0]
                         similarity_score = float(best['similarity'])
-                        case_id = best['person'].case_id
+                        matched_person = best['person']
+                        case_id = matched_person.case_id
                         status = 'POTENTIAL_MATCH' if best.get('combined_score', 0.0) >= 80 else 'NO_RELEVANT_MATCH'
+                        match_chart = match_chart_data(matches)
+                        for candidate in matches:
+                            person = candidate['person']
+                            candidate_match = None
+                            # Keep every ranked lead reviewable, including lower-confidence leads;
+                            # the reviewer sees the score and decides whether it is relevant.
+                            if normalize_case_status(person.status) != 'PERSON_FOUND':
+                                # One review item per case per webcam session; frame polling must not
+                                # create a new investigator task every few seconds.
+                                candidate_match = AIMatch.query.filter_by(
+                                    source_type='WEBCAM', source_id=session_record.id,
+                                    missing_person_id=person.id,
+                                ).order_by(AIMatch.created_at.desc()).first()
+                                if not candidate_match:
+                                    candidate_match = AIMatch(
+                                        source_type='WEBCAM', source_id=session_record.id,
+                                        missing_person_id=person.id,
+                                        similarity_score=candidate['similarity'],
+                                        combined_score=candidate['combined_score'],
+                                        status='REQUIRES_HUMAN_VERIFICATION',
+                                    )
+                                    db.session.add(candidate_match)
+                                    db.session.flush()
+                            ranked_candidates.append({
+                                'case': person_json(person),
+                                'similarity_score': candidate['similarity'],
+                                'status': normalize_match_status(candidate_match.status) if candidate_match else 'LOW_CONFIDENCE_LEAD',
+                                'match_id': candidate_match.id if candidate_match and normalize_match_status(candidate_match.status) == 'REQUIRES_HUMAN_VERIFICATION' else None,
+                            })
+                        if status == 'POTENTIAL_MATCH' and ranked_candidates:
+                            match_id = ranked_candidates[0]['match_id']
                         evidence_message = 'AI Evidence Indicator: plausible relevant match requiring human review.' if status == 'POTENTIAL_MATCH' else 'AI Evidence Indicator: no relevant match in the current reference set.'
                     else:
                         evidence_message = 'AI Evidence Indicator: no relevant match in the current reference set.'
@@ -938,7 +1108,12 @@ def webcam_process_frame():
                 'label': 'Face ' + str(index),
                 'case_id': case_id,
                 'similarity_score': similarity_score,
+                'matched_person': person_json(matched_person) if matched_person and status == 'POTENTIAL_MATCH' else None,
+                'match_id': match_id,
+                'ranked_matches': ranked_candidates,
+                'chart': match_chart,
             }
+            cache_webcam_face_result(session_record.session_id, face_id, face_result)
             face_results.append(face_result)
 
         session_record.faces_processed = (session_record.faces_processed or 0) + len(faces)
@@ -1008,8 +1183,6 @@ def webcam_session_details(session_id):
         'session_id': session_record.session_id,
         'investigator_id': session_record.investigator_id,
         'location_name': session_record.location_name,
-        'latitude': session_record.latitude,
-        'longitude': session_record.longitude,
         'monitoring_description': session_record.monitoring_description,
         'status': session_record.status,
         'faces_processed': session_record.faces_processed,
@@ -1035,7 +1208,48 @@ def webcam_session_matches(session_id):
         'status': row.status,
         'frame_timestamp': row.frame_timestamp,
         'created_at': row.created_at.isoformat(),
+        'person': person_json(MissingPerson.query.filter_by(case_id=row.case_id).first())
+            if row.case_id and MissingPerson.query.filter_by(case_id=row.case_id).first() else None,
     } for row in rows])
+
+
+@app.post('/api/ai/webcam/session/<session_id>/review')
+@require_auth({'FAMILY_USER', 'CITIZEN', 'INVESTIGATOR', 'ADMIN_DEMO'})
+def create_webcam_review(session_id):
+    session_record = WebcamSession.query.filter_by(session_id=session_id).first()
+    if not session_record:
+        return api_error('Webcam session not found.', 404)
+    if not can_access_webcam_session(session_record):
+        return api_error('You do not have permission to request review for this webcam session.', 403)
+    payload = request.get_json(silent=True) or {}
+    case_id = (payload.get('case_id') or '').strip()
+    person = MissingPerson.query.filter_by(case_id=case_id).first() if case_id else None
+    if not person:
+        return api_error('The related missing-person case could not be found.', 404)
+    match = AIMatch.query.filter_by(
+        source_type='WEBCAM', source_id=session_record.id,
+        missing_person_id=person.id,
+    ).order_by(AIMatch.created_at.desc()).first()
+    if match and normalize_match_status(match.status) == 'REQUIRES_HUMAN_VERIFICATION':
+        return jsonify(match_id=match.id, status=normalize_match_status(match.status))
+    if match and normalize_match_status(match.status) == 'VERIFIED_BY_AUTHORIZED_USER':
+        return api_error('This webcam lead has already been verified.', 409)
+    if match:
+        return api_error('This webcam lead has already been reviewed.', 409)
+    try:
+        similarity_score = float(payload.get('similarity_score'))
+    except (TypeError, ValueError):
+        return api_error('A similarity score is required for the review record.', 400)
+    if not 0 <= similarity_score <= 100:
+        return api_error('Similarity score must be between 0 and 100.', 400)
+    match = AIMatch(
+        source_type='WEBCAM', source_id=session_record.id,
+        missing_person_id=person.id, similarity_score=similarity_score,
+        combined_score=similarity_score, status='REQUIRES_HUMAN_VERIFICATION',
+    )
+    db.session.add(match)
+    db.session.commit()
+    return jsonify(match_id=match.id, status=normalize_match_status(match.status)), 201
 
 
 @app.get('/api/missing-persons')
@@ -1060,7 +1274,6 @@ def create_person():
             return api_error('Name and photograph are required.')
         p = MissingPerson(case_id=next_case_id(), registered_by=current_user().id, name=d['name'], age=int(d['age']) if d.get('age') else None, gender=d.get('gender'), photo=photo,
                          description=d.get('description'), clothing_description=d.get('clothing_description'), last_seen_location=d.get('last_seen_location'),
-                         latitude=float(d['latitude']) if d.get('latitude') else None, longitude=float(d['longitude']) if d.get('longitude') else None,
                          last_seen_date=date.fromisoformat(d['last_seen_date']) if d.get('last_seen_date') else None, last_seen_time=d.get('last_seen_time'))
         db.session.add(p); db.session.flush(); vector = embedding_from_file(os.path.join(app.config['UPLOAD_FOLDER'], os.path.basename(photo)))
         db.session.add(FaceEmbedding(missing_person_id=p.id, embedding_vector=json.dumps(vector.tolist()), model_name='opencv-normalized-face-descriptor', embedding_dimension=len(vector)))
@@ -1121,12 +1334,13 @@ def ai_search():
 @require_auth()
 def sighting():
     try:
-        d = request.form; case = MissingPerson.query.filter_by(case_id=d.get('case_id')).first()
+        d = request.form
+        case_id = (d.get('case_id') or '').strip().upper()
+        case = MissingPerson.query.filter(db.func.upper(MissingPerson.case_id) == case_id).first() if case_id else None
         if not case:
-            return api_error('A valid related case ID is required.', 404)
+            return api_error('No missing-person case matches that ID. Enter the JR-YYYY-NNNN case ID shown in Missing persons.', 404)
         s = Sighting(case_id=case.case_id, reported_by=current_user().id, photo=save_file(request.files.get('photo')),
-                     description=d.get('description'), location_name=d.get('location_name'),
-                     latitude=float(d['latitude']) if d.get('latitude') else None, longitude=float(d['longitude']) if d.get('longitude') else None)
+                     description=d.get('description'), location_name=d.get('location_name'))
         db.session.add(s); add_timeline(case.case_id, 'SIGHTING_REPORTED', 'Citizen sighting submitted.', current_user().id)
         notify_case(case.case_id, 'New sighting reported', f'A new sighting was reported for {case.case_id}.')
         db.session.commit(); return jsonify(message='Sighting submitted for investigator review.'), 201
@@ -1143,7 +1357,6 @@ def found():
             return api_error('A photograph is required.')
         exclude_case_id = (d.get('exclude_case_id') or '').strip()
         report = FoundPerson(reported_by=current_user().id, photo=photo, description=d.get('description'), location_name=d.get('location_name'),
-                             latitude=float(d['latitude']) if d.get('latitude') else None, longitude=float(d['longitude']) if d.get('longitude') else None,
                              found_date=date.today())
         db.session.add(report); db.session.flush(); matches = search_embedding(embedding_from_file(os.path.join(app.config['UPLOAD_FOLDER'], os.path.basename(photo))), 'FOUND_PERSON', report.id)
         matches = apply_exclusion(matches, exclude_case_id)
@@ -1200,11 +1413,13 @@ def matches():
 
 
 @app.get('/api/matches/<int:match_id>')
-@require_auth({'INVESTIGATOR', 'ADMIN_DEMO'})
+@require_auth({'INVESTIGATOR', 'ADMIN_DEMO', 'FAMILY_USER', 'CITIZEN'})
 def get_match(match_id):
     match = db.session.get(AIMatch, match_id)
     if not match:
         return api_error('Potential match not found.', 404)
+    if not can_review_match(match):
+        return api_error('You do not have permission to review this potential match.', 403)
     case = db.session.get(MissingPerson, match.missing_person_id)
     if not case:
         return api_error('Associated missing-person case not found.', 404)
@@ -1253,13 +1468,20 @@ def get_match(match_id):
 
 
 @app.post('/api/matches/<int:match_id>/verify')
-@require_auth({'INVESTIGATOR', 'ADMIN_DEMO'})
+@require_auth({'INVESTIGATOR', 'ADMIN_DEMO', 'FAMILY_USER', 'CITIZEN'})
 def verify_match(match_id):
     payload = request.get_json() or {}
     decision = str(payload.get('decision', '')).upper()
     match = db.session.get(AIMatch, match_id)
     if not match:
         return api_error('Potential match not found.', 404)
+    if not can_review_match(match):
+        return api_error('You do not have permission to verify this potential match.', 403)
+    if normalize_match_status(match.status) == 'VERIFIED_BY_AUTHORIZED_USER' and decision == 'VERIFIED':
+        case = db.session.get(MissingPerson, match.missing_person_id)
+        return jsonify(message='This match has already been verified.',
+                       case={'case_id': case.case_id, 'status': normalize_case_status(case.status)} if case else None,
+                       match={'id': match.id, 'status': normalize_match_status(match.status)}), 200
     if normalize_match_status(match.status) != 'REQUIRES_HUMAN_VERIFICATION':
         return api_error('This match is no longer awaiting human verification.', 409)
     if decision not in {'VERIFIED', 'NOT_RELEVANT'}:
@@ -1274,30 +1496,44 @@ def verify_match(match_id):
             return api_error('Verification notes are required.', 400)
         match.status = 'VERIFIED_BY_AUTHORIZED_USER'
         case.status = 'PERSON_FOUND'
-        add_timeline(case.case_id, 'POTENTIAL_MATCH_VERIFIED', 'Potential match verified by authorized investigator. Case status updated to Person Found.', actor.id)
+        add_timeline(case.case_id, 'POTENTIAL_MATCH_VERIFIED', 'Potential match verified by an authorized user. Case status updated to Person Found.', actor.id)
         add_audit_log(actor.id, case.case_id, match.id, 'MATCH_VERIFIED', {'decision': 'VERIFIED', 'notes': notes})
         recipient = db.session.get(User, case.registered_by)
-        if not recipient or not recipient.email:
-            return api_error('Registered user email is unavailable for notification.', 400)
-        db.session.add(Notification(user_id=case.registered_by, title='Important Case Update',
-                                  message=f'Your missing-person case {case.case_id} has been updated to Person Found after authorized verification.',
-                                  type='CASE_VERIFIED'))
-        notification = EmailNotification(case_id=case.case_id, match_id=match.id, recipient_user_id=recipient.id,
-                                         recipient_email=recipient.email, notification_type='VERIFIED_MATCH',
-                                         subject=f'JanRaksha AI — Important Update for Case {case.case_id}', status='PENDING', attempt_count=1)
-        db.session.add(notification); db.session.flush()
-        add_audit_log(actor.id, case.case_id, match.id, 'EMAIL_NOTIFICATION_CREATED', {'notification_id': notification.id, 'email': recipient.email})
-        try:
-            send_verified_match_email(case.case_id, recipient.name, recipient.email)
-            notification.status = 'SENT'; notification.sent_at = datetime.utcnow(); notification.failure_reason = None
-            add_audit_log(actor.id, case.case_id, match.id, 'EMAIL_SENT', {'notification_id': notification.id, 'email': recipient.email})
-        except Exception as exc:
-            notification.status = 'FAILED'; notification.failure_reason = str(exc)[:500]
-            add_audit_log(actor.id, case.case_id, match.id, 'EMAIL_FAILED', {'notification_id': notification.id, 'reason': str(exc)[:500]})
-            for admin in User.query.filter_by(role='ADMIN_DEMO').all():
-                db.session.add(Notification(user_id=admin.id, title='Email delivery failed',
-                                          message=f'Verified match email for case {case.case_id} could not be delivered to {recipient.email}.', type='warning'))
-        db.session.commit(); return jsonify(message='✓ Match Verified Successfully', case={'case_id': case.case_id, 'status': normalize_case_status(case.status)}, match={'id': match.id, 'status': normalize_match_status(match.status)}, email={'status': notification.status, 'id': notification.id}), 200
+        email_status = 'NO_REGISTERED_EMAIL'
+        email_failure_reason = None
+        if recipient:
+            db.session.add(Notification(user_id=recipient.id, title='Important Case Update',
+                                      message=f'Your missing-person case {case.case_id} has been updated to Person Found after human verification.',
+                                      type='CASE_VERIFIED'))
+            if recipient.email:
+                notification = EmailNotification(case_id=case.case_id, match_id=match.id, recipient_user_id=recipient.id,
+                                                 recipient_email=recipient.email, notification_type='VERIFIED_MATCH',
+                                                 subject=f'JanRaksha AI — Important Update for Case {case.case_id}', status='PENDING', attempt_count=1)
+                db.session.add(notification); db.session.flush()
+                add_audit_log(actor.id, case.case_id, match.id, 'EMAIL_NOTIFICATION_CREATED', {'notification_id': notification.id, 'email': recipient.email})
+                try:
+                    send_verified_match_email(case.case_id, recipient.name, recipient.email)
+                    notification.status = 'SENT'; notification.sent_at = datetime.utcnow(); notification.failure_reason = None
+                    email_status = 'SENT'
+                    add_audit_log(actor.id, case.case_id, match.id, 'EMAIL_SENT', {'notification_id': notification.id, 'email': recipient.email})
+                except Exception as exc:
+                    notification.status = 'FAILED'; notification.failure_reason = str(exc)[:500]
+                    email_status = 'FAILED'
+                    email_failure_reason = notification.failure_reason
+                    add_audit_log(actor.id, case.case_id, match.id, 'EMAIL_FAILED', {'notification_id': notification.id, 'reason': str(exc)[:500]})
+                    for admin in User.query.filter_by(role='ADMIN_DEMO').all():
+                        db.session.add(Notification(user_id=admin.id, title='Email delivery failed',
+                                                  message=f'Verified match email for case {case.case_id} could not be delivered to {recipient.email}.', type='warning'))
+        db.session.commit()
+        if email_status == 'SENT':
+            message = f'Match verified successfully. Confirmation email sent to {recipient.email}.'
+        elif email_status == 'NO_REGISTERED_EMAIL':
+            message = 'Match verified successfully; no registered email address is available for email notification.'
+        elif email_failure_reason == 'SMTP configuration missing.':
+            message = 'Match verified successfully, but no email was sent: SMTP is not configured. Add your mail provider settings to the project .env file and restart the app.'
+        else:
+            message = f'Match verified successfully, but email delivery failed: {email_failure_reason or "check the app server log"}'
+        return jsonify(message=message, case={'case_id': case.case_id, 'status': normalize_case_status(case.status)}, match={'id': match.id, 'status': normalize_match_status(match.status)}, email={'status': email_status, 'failure_reason': email_failure_reason}), 200
 
     match.status = 'NOT_RELEVANT'; add_timeline(case.case_id, 'AI_MATCH_REVIEWED', 'AI potential match reviewed and marked not relevant.', actor.id)
     add_timeline(case.case_id, 'MATCH_RECORDED', 'No person-found notification was sent because the lead was marked not relevant.', actor.id)
@@ -1306,13 +1542,15 @@ def verify_match(match_id):
 
 
 @app.post('/api/matches/<int:match_id>/not-relevant')
-@require_auth({'INVESTIGATOR', 'ADMIN_DEMO'})
+@require_auth({'INVESTIGATOR', 'ADMIN_DEMO', 'FAMILY_USER', 'CITIZEN'})
 def mark_not_relevant(match_id):
     payload = request.get_json() or {}
     notes = (payload.get('notes') or 'Marked not relevant by authorized investigator.').strip()
     match = db.session.get(AIMatch, match_id)
     if not match:
         return api_error('Potential match not found.', 404)
+    if not can_review_match(match):
+        return api_error('You do not have permission to review this potential match.', 403)
     if normalize_match_status(match.status) == 'VERIFIED_BY_AUTHORIZED_USER':
         return api_error('This verified match cannot be changed to not relevant.', 409)
     match.status = 'NOT_RELEVANT';
@@ -1421,17 +1659,42 @@ def remove_trusted_contact(contact_id):
 @require_auth()
 def activate_sos():
     d = request.get_json() or {}; user = current_user()
-    event = EmergencyEvent(user_id=user.id, latitude=d.get('latitude'), longitude=d.get('longitude'), location_name=d.get('location_name'),
+    event = EmergencyEvent(user_id=user.id, location_name=d.get('location_name'),
                           message=d.get('message') or 'I activated an SOS alert and need assistance.')
     db.session.add(event); db.session.flush()
-    location = d.get('location_name') or (f"Coordinates: {d.get('latitude')}, {d.get('longitude')}" if d.get('latitude') is not None else 'Location unavailable')
+    location = d.get('location_name') or 'Location unavailable'
     body = f'JanRaksha AI SOS from {user.name}. {event.message}\nLocation: {location}\nTime: {event.created_at.strftime("%Y-%m-%d %H:%M UTC")}\n\nContact emergency services if there is immediate danger.'
-    contacts = TrustedContact.query.filter_by(user_id=user.id).all(); delivered = []
+    contacts = TrustedContact.query.filter_by(user_id=user.id).all()
+    recipients = {user.email.strip().lower(): user.email.strip()}
     for contact in contacts:
-        if send_email(contact.email, 'JanRaksha AI SOS alert', body):
-            delivered.append(contact.email)
-    db.session.add(Notification(user_id=user.id, title='SOS activated', message=f'SOS event #{event.id} activated. Email alerts delivered to {len(delivered)} trusted contacts.', type='emergency'))
-    db.session.commit(); return jsonify(message='SOS activated. Trusted contacts were notified where email delivery is configured.', event={'id': event.id, 'status': event.status, 'created_at': event.created_at.isoformat()}, email_deliveries=len(delivered)), 201
+        if contact.email and contact.email.strip():
+            address = contact.email.strip()
+            recipients.setdefault(address.lower(), address)
+    delivered = [address for address in recipients.values() if send_email(address, 'JanRaksha AI SOS alert', body)]
+    delivery_summary = f'{len(delivered)} of {len(recipients)} email recipient(s)'
+    notification = Notification(user_id=user.id, title='SOS activated', message=f'SOS event #{event.id} activated. Email delivered to {delivery_summary}.', type='emergency')
+    db.session.add(notification)
+    db.session.commit()
+    push_user_ids = {user.id}
+    contact_emails = {address.lower() for address in recipients.values() if address.lower() != user.email.lower()}
+    if contact_emails:
+        contact_accounts = User.query.filter(db.func.lower(User.email).in_(contact_emails)).with_entities(User.id).all()
+        push_user_ids.update(user_id for (user_id,) in contact_accounts)
+    push_result = send_web_push(
+        push_user_ids,
+        'JanRaksha emergency alert',
+        'An emergency alert was activated. Open JanRaksha to view the details.',
+    )
+    if push_result['configured']:
+        push_summary = f"phone notification sent to {push_result['sent']} of {push_result['total']} enabled device(s)"
+    else:
+        push_summary = 'phone notifications are not configured on this server'
+    notification.message += f' Phone push: {push_summary}.'
+    db.session.commit()
+    message = f'SOS activated. Email sent to {delivery_summary}. {push_summary.capitalize()}.'
+    if len(delivered) < len(recipients):
+        message += ' Check SMTP settings and server logs for email failures.'
+    return jsonify(message=message, event={'id': event.id, 'status': event.status, 'created_at': event.created_at.isoformat()}, email_deliveries=len(delivered), email_recipients=len(recipients), push_deliveries=push_result['sent'], push_subscriptions=push_result['total'], push_configured=push_result['configured']), 201
 
 
 @app.put('/api/emergency/sos/<int:event_id>/cancel')
@@ -1461,8 +1724,6 @@ def emergency_case_json(case):
         'reporter_contact': case.reporter_contact,
         'description': case.description,
         'location_name': case.location_name,
-        'latitude': case.latitude,
-        'longitude': case.longitude,
         'attachment': f'/api/emergency/case-attachments/{case.case_id}' if case.attachment else None,
         'status': case.status,
         'assigned_officer_id': case.assigned_officer_id,
@@ -1501,15 +1762,6 @@ def create_emergency_case():
         return api_error('Reporter name or contact exceeds the allowed length.')
     if submission_key and len(submission_key) > 64:
         return api_error('Invalid submission token.')
-    try:
-        latitude = float(request.form['latitude']) if request.form.get('latitude') else None
-        longitude = float(request.form['longitude']) if request.form.get('longitude') else None
-    except ValueError:
-        return api_error('Coordinates must be valid numbers.')
-    if ((latitude is None) != (longitude is None)
-            or (latitude is not None and (not math.isfinite(latitude) or not -90 <= latitude <= 90))
-            or (longitude is not None and (not math.isfinite(longitude) or not -180 <= longitude <= 180))):
-        return api_error('Provide both valid latitude and longitude coordinates.')
     if submission_key:
         existing = EmergencyCase.query.filter_by(submission_key=submission_key).first()
         if existing:
@@ -1529,8 +1781,6 @@ def create_emergency_case():
         reporter_contact=reporter_contact or None,
         description=description,
         location_name=location_name,
-        latitude=latitude,
-        longitude=longitude,
         attachment=attachment,
     )
     db.session.add(case)

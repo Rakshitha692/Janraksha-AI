@@ -14,6 +14,7 @@
 .safety-service-card.police .safety-service-icon{background:linear-gradient(135deg,#4d79ff,#2d5bba)}
 .safety-service-card.women .safety-service-icon{background:linear-gradient(135deg,#ff7aa2,#d74b7b)}
 .safety-service-card.child .safety-service-icon{background:linear-gradient(135deg,#9b8cff,#5d4bd4)}
+.safety-service-card.emergency .safety-service-icon{background:linear-gradient(135deg,#ef5965,#c92a3a)}
 .safety-service-label{font-weight:700;color:var(--navy);line-height:1.3}
 .safety-community-footer{display:flex;align-items:center;justify-content:space-between;gap:1rem;padding:1rem 0 0;border-top:1px solid rgba(18,59,99,.08)}
 .safety-community-footer span{font-weight:700;color:var(--navy)}

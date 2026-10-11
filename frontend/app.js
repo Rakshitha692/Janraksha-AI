@@ -1,14 +1,17 @@
-let me=null, cases=[], policeRefreshTimer=null; const $=s=>document.querySelector(s);
+let me=null, cases=[], policeRefreshTimer=null, phonePushSetup=null; const $=s=>document.querySelector(s);
 const api=async(url,opts={})=>{let r=await fetch(url,opts),d=await r.json().catch(()=>({}));if(!r.ok)throw Error(d.error||`Request failed (HTTP ${r.status}). Check that the server is running the latest app code.`);return d};
 const toast=m=>{let t=$('#toast');t.textContent=m;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),3200)};
 const escapeHtml=value=>String(value??'').replace(/[&<>"']/g,character=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[character]));
+function decodeVapidKey(value){const padding='='.repeat((4-value.length%4)%4),base64=(value+padding).replace(/-/g,'+').replace(/_/g,'/'),raw=atob(base64);return Uint8Array.from(raw,char=>char.charCodeAt(0))}
+async function preparePhonePush(){if(!window.isSecureContext||!('serviceWorker'in navigator)||!('PushManager'in window)||!('Notification'in window))throw Error('Phone push needs a supported browser and a secure HTTPS site.');const [config,registration]=await Promise.all([api('/api/push/public-key'),navigator.serviceWorker.register('/service-worker.js')]);return{config,registration}}
+async function enablePhoneNotifications(button){const status=$('#phoneNotificationStatus');button.disabled=true;try{if(/iphone|ipad|ipod/i.test(navigator.userAgent)&&!navigator.standalone&&!matchMedia('(display-mode: standalone)').matches)throw Error('On iPhone, add JanRaksha to the Home Screen from Safari, open it there, then enable notifications.');if(Notification.permission==='denied')throw Error('Notifications are blocked for this site. Allow them in your browser or phone settings.');if(Notification.permission!=='granted'&&await Notification.requestPermission()!=='granted')throw Error('Notification permission was not granted.');const {config,registration}=await phonePushSetup;let subscription=await registration.pushManager.getSubscription();if(!subscription)subscription=await registration.pushManager.subscribe({userVisibleOnly:true,applicationServerKey:decodeVapidKey(config.public_key)});await api('/api/push/subscription',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(subscription.toJSON())});button.textContent='Phone notifications enabled';status.textContent='This phone or browser can receive JanRaksha alerts.';toast('Phone notifications enabled on this device.')}catch(error){status.textContent=error.message;toast(error.message)}finally{button.disabled=false}}
 function showAuth(which){$('#authView').classList.remove('d-none');$('#loginModal').classList.toggle('d-none',which!=='login');$('#registerModal').classList.toggle('d-none',which!=='register')};function hideAuth(){$('#loginModal').classList.add('d-none');$('#registerModal').classList.add('d-none')}
 $('#loginForm').onsubmit=async e=>{e.preventDefault();try{let f=new FormData(e.target);await api('/api/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(Object.fromEntries(f))});boot()}catch(x){toast(x.message)}};
 $('#registerForm').onsubmit=async e=>{e.preventDefault();try{let f=new FormData(e.target),d=Object.fromEntries(f);d.terms=f.get('terms')==='on';await api('/api/auth/register',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)});boot()}catch(x){toast(x.message)}};
-async function boot(){try{me=(await api('/api/users/me')).user}catch{if(window.location.pathname==='/police'){me=null;$('#authView').classList.add('d-none');$('#appView').classList.remove('d-none');$('#userName').textContent='';$('#roleBadge').textContent='POLICE PORTAL';showPolicePortalShell();policePortal($('#page'))}return}$('#authView').classList.add('d-none');hideAuth();$('#appView').classList.remove('d-none');$('#userName').textContent=me.name;$('#roleBadge').textContent=me.role.replace('_',' ');if(window.location.pathname==='/police'){showPolicePortalShell();return policePortal($('#page'))}const matchMatch = window.location.pathname.match(/\/investigator\/matches\/(\d+)/);if(matchMatch && ['INVESTIGATOR','ADMIN_DEMO'].includes(me.role)){return openInvestigatorMatch(Number(matchMatch[1]));}go('dashboard')}
+async function boot(){try{me=(await api('/api/users/me')).user}catch{if(window.location.pathname==='/police'){me=null;$('#authView').classList.add('d-none');$('#appView').classList.remove('d-none');$('#userName').textContent='';$('#roleBadge').textContent='POLICE PORTAL';showPolicePortalShell();policePortal($('#page'))}return}$('#authView').classList.add('d-none');hideAuth();$('#appView').classList.remove('d-none');$('#userName').textContent=me.name;$('#roleBadge').textContent=me.role.replace('_',' ');if(window.location.pathname==='/police'){showPolicePortalShell();return policePortal($('#page'))}const matchMatch = window.location.pathname.match(/\/investigator\/matches\/(\d+)/);if(matchMatch && ['INVESTIGATOR','ADMIN_DEMO','FAMILY_USER','CITIZEN'].includes(me.role)){return openInvestigatorMatch(Number(matchMatch[1]));}go(new URLSearchParams(location.search).get('page')==='emergency'?'emergency':'dashboard')}
 document.querySelectorAll('.nav-link[data-page]').forEach(b=>b.onclick=()=>go(b.dataset.page));$('.logout').onclick=async()=>{await api('/api/auth/logout',{method:'POST'});location.reload()};
 const heading=(t,s='')=>`<h1 class="page-title">${t}</h1><p class="page-subtitle">${s}</p>`;
-async function go(page){clearInterval(policeRefreshTimer);policeRefreshTimer=null;document.querySelectorAll('.nav-link').forEach(x=>x.classList.toggle('active',x.dataset.page===page));let el=$('#page');el.innerHTML='<div class="empty">Loading…</div>';try{if(page==='dashboard'){await dashboard(el);return}if(page==='cases'){await gallery(el);return}if(page==='register-case'){await caseForm(el);return}if(page==='search'){await search(el);return}if(page==='webcam'){await webcamSearch(el);return}if(page==='sighting'){await sightingForm(el);return}if(page==='found'){await foundForm(el);return}if(page==='notifications'){await notifications(el);return}if(page==='emergency'){await emergency(el);return}if(page==='police-portal'){await policePortal(el);return}}catch(e){el.innerHTML=`<div class="alert alert-danger">${escapeHtml(e.message)}</div>`}}
+async function go(page){clearInterval(policeRefreshTimer);policeRefreshTimer=null;const activePage=['emergency','emergency-center'].includes(page)?'emergency-community':page;document.querySelectorAll('.nav-link').forEach(x=>x.classList.toggle('active',x.dataset.page===activePage));let el=$('#page');el.innerHTML='<div class="empty">Loading…</div>';try{if(page==='dashboard'){await dashboard(el);return}if(page==='cases'){await gallery(el);return}if(page==='register-case'){await caseForm(el);return}if(page==='search'){await search(el);return}if(page==='webcam'){await webcamSearch(el);return}if(page==='sighting'){await sightingForm(el);return}if(page==='found'){await foundForm(el);return}if(page==='notifications'){await notifications(el);return}if(page==='emergency'){await emergency(el,true);return}if(page==='emergency-community'){await emergency(el);return}if(page==='emergency-center'){await emergency(el,true);return}if(page==='police-portal'){await policePortal(el);return}}catch(e){el.innerHTML=`<div class="alert alert-danger">${escapeHtml(e.message)}</div>`}}
 
 const webcamState={stream:null,active:false,starting:false,sessionId:null,processing:false,intervalId:null,facingMode:'user'};
 
@@ -37,10 +40,14 @@ async function webcamSearch(el){
         <div><strong>Faces detected:</strong> <span id="facesDetected">0</span></div>
         <div><strong>Processing:</strong> <span id="processingStatus">Idle</span></div>
       </div>
+      <div id="capturedFramePreview" class="captured-frame-preview d-none mt-3">
+        <strong>Last captured frame</strong>
+        <img alt="Most recently captured webcam frame" class="captured-frame-image">
+      </div>
       <div id="webcamResults" class="webcam-results mt-3"></div>
     </div>
   `;
-  const video=$('#webcamVideo'); const overlay=$('#faceOverlay'); const statusEl=$('#cameraStatus'); const facesEl=$('#facesDetected'); const processEl=$('#processingStatus'); const resultsEl=$('#webcamResults'); const faceElements=new Map();
+  const video=$('#webcamVideo'); const overlay=$('#faceOverlay'); const statusEl=$('#cameraStatus'); const facesEl=$('#facesDetected'); const processEl=$('#processingStatus'); const resultsEl=$('#webcamResults'); const previewEl=$('#capturedFramePreview'); const previewImage=previewEl.querySelector('img'); const faceElements=new Map();
   const startButton=$('#startCameraBtn'); const stopButton=$('#stopCameraBtn'); const captureButton=$('#captureFrameBtn'); const switchButton=$('#switchCameraBtn');
   function updateStatus(label){ statusEl.textContent = label; }
   function setProcessing(label){ processEl.textContent = label; }
@@ -121,9 +128,48 @@ async function webcamSearch(el){
     });
     const candidates = document.createElement('div');
     candidates.className = 'webcam-candidates';
+    const hasRankedLeads = items.some(item => item.ranked_matches?.length);
     items.forEach((item, index) => {
       const result = document.createElement('div');
-      result.className = 'result';
+      result.className = `result webcam-result${item.status === 'POTENTIAL_MATCH' ? ' webcam-result-potential' : ''}`;
+      if (item.ranked_matches?.length) {
+        const reviewNote = document.createElement('p');
+        reviewNote.className = 'webcam-review-note';
+        reviewNote.textContent = item.status === 'POTENTIAL_MATCH'
+          ? 'Human verification required. Similarity is not proof of identity.'
+          : 'Human review is required before drawing conclusions. This is a low-confidence similarity, not a confirmed match.';
+        result.appendChild(reviewNote);
+        const similarityChart = renderWebcamSimilarityChart(item.ranked_matches);
+        result.appendChild(similarityChart);
+        const rankedCards = document.createElement('div');
+        rankedCards.innerHTML = renderMatchGrid(item.ranked_matches, false, null, true);
+        result.appendChild(rankedCards);
+        rankedCards.querySelectorAll('[data-webcam-verify]').forEach(verifyButton => {
+          verifyButton.addEventListener('click', async () => {
+            verifyButton.disabled = true;
+            try {
+              const candidate = item.ranked_matches.find(match => match.case?.case_id === verifyButton.dataset.caseId);
+              if (!candidate) throw new Error('Could not find this similarity result.');
+              let matchId = candidate.match_id;
+              if (!matchId) {
+                const response = await api(`/api/ai/webcam/session/${encodeURIComponent(webcamState.sessionId)}/review`, {
+                  method: 'POST',
+                  headers: {'Content-Type':'application/json'},
+                  body: JSON.stringify({case_id: candidate.case.case_id, similarity_score: candidate.similarity_score})
+                });
+                matchId = response.match_id;
+                candidate.match_id = matchId;
+              }
+              await openInvestigatorMatch(matchId);
+            } catch (error) {
+              toast(error.message || 'Could not open the verification form.');
+              verifyButton.disabled = false;
+            }
+          });
+        });
+        candidates.appendChild(result);
+        return;
+      }
       const label = document.createElement('div');
       const scoreAvailable = item.similarity_score !== null && item.similarity_score !== undefined
         && Number.isFinite(Number(item.similarity_score));
@@ -133,27 +179,73 @@ async function webcamSearch(el){
       result.appendChild(label);
       candidates.appendChild(result);
     });
-    resultsEl.replaceChildren(summary, candidates);
+    resultsEl.replaceChildren(...(hasRankedLeads ? [candidates] : [summary, candidates]));
   }
-  async function processFrame(){
+  function renderWebcamSimilarityChart(matches){
+    const chart = document.createElement('div');
+    chart.className = 'webcam-similarity-chart';
+    const heading = document.createElement('h5');
+    heading.textContent = 'Ranked identification leads';
+    chart.appendChild(heading);
+    [...matches].sort((a,b)=>Number(b.similarity_score)-Number(a.similarity_score)).forEach((match,index)=>{
+      const row = document.createElement('div');
+      row.className = 'webcam-chart-row';
+      const rank = document.createElement('span');
+      rank.textContent = `Lead ${index + 1}`;
+      const track = document.createElement('div');
+      track.className = 'webcam-chart-track';
+      const bar = document.createElement('span');
+      bar.style.width = `${Math.max(0, Math.min(100, Number(match.similarity_score) || 0))}%`;
+      track.appendChild(bar);
+      const score = document.createElement('strong');
+      score.textContent = `${Number(match.similarity_score || 0).toFixed(1)}%`;
+      row.append(rank, track, score);
+      chart.appendChild(row);
+    });
+    return chart;
+  }
+  async function addFallbackWebcamMatches(faces=[]){
+    await Promise.all(faces.map(async face=>{
+      if (face.ranked_matches?.length || !face.case_id || !Number.isFinite(Number(face.similarity_score))) return;
+      try {
+        const response = await api('/api/missing-persons?q=' + encodeURIComponent(face.case_id));
+        const person = (response.items || []).find(entry => entry.case_id === face.case_id);
+        if (person) face.ranked_matches = [{
+          case: person,
+          similarity_score: Number(face.similarity_score),
+          status: face.status === 'POTENTIAL_MATCH' ? 'REQUIRES_HUMAN_VERIFICATION' : 'LOW_CONFIDENCE_LEAD',
+          match_id: face.match_id || null,
+        }];
+      } catch (error) {
+        console.warn('Could not load the reference photo for a webcam similarity result.', error);
+      }
+    }));
+    return faces;
+  }
+  async function processFrame({manual=false}={}){
     if (!webcamState.active || webcamState.processing || !video || !video.videoWidth) return;
-    webcamState.processing = true; setProcessing('Active');
+    webcamState.processing = true; setProcessing(manual ? 'Capturing and analyzing frame…' : 'Active');
     try {
       const canvas = document.createElement('canvas');
       canvas.width = video.videoWidth; canvas.height = video.videoHeight;
       const ctx = canvas.getContext('2d');
       if (!ctx) throw new Error('Could not prepare a webcam frame. Try reloading the page.');
       ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      if (manual) {
+        previewImage.src = canvas.toDataURL('image/jpeg', 0.85);
+        previewEl.classList.remove('d-none');
+      }
       const blob = await new Promise((resolve, reject) => {
         canvas.toBlob(frame => frame ? resolve(frame) : reject(new Error('Could not capture a webcam frame.')), 'image/jpeg', 0.85);
       });
       const form = new FormData(); form.append('frame', blob, 'webcam-frame.jpg'); form.append('session_id', webcamState.sessionId);
       const data = await api('/api/ai/webcam/process-frame', {method:'POST', body:form});
       if (!webcamState.active) return;
-      const faces = data.faces || [];
+      const faces = await addFallbackWebcamMatches(data.faces || []);
       renderFaceBoxes(faces);
       facesEl.textContent = String(data.faces_detected || 0);
       renderDetectionStatus(faces);
+      if (manual) toast(faces.length ? 'Frame captured and analyzed.' : 'Frame captured. No face was detected. Try a clearer, well-lit view.');
     } catch (error) {
       toast(error.message || 'Webcam frame processing failed.');
     } finally {
@@ -222,11 +314,19 @@ async function webcamSearch(el){
     syncWebcamControls();
   }
   async function captureSingleFrame(){
-    if (!webcamState.active || !video || !video.videoWidth) {
+    if (!webcamState.active) {
       toast('Start the camera before capturing a frame.');
       return;
     }
-    await processFrame();
+    if (!video || !video.videoWidth) {
+      toast('The camera is starting. Wait until the live preview appears, then capture a frame.');
+      return;
+    }
+    if (webcamState.processing) {
+      toast('A frame is already being analyzed. Please wait for it to finish.');
+      return;
+    }
+    await processFrame({manual:true});
   }
   startButton.onclick = startWebcam;
   stopButton.onclick = stopWebcam;
@@ -274,7 +374,7 @@ async function reviewPotentialMatch(matchId, caseId){
 async function dashboard(el){let s=await api('/api/dashboard/statistics');let caseUpdate='';try{let casesList=(await api('/api/missing-persons')).items, foundCases=casesList.filter(p=>String(p.status).toUpperCase().replace(/ /g,'_')==='PERSON_FOUND');if(foundCases.length){caseUpdate=`<div class="panel"><h4>Case Update</h4><div class="alert-ai"><strong>🟢 Person Found</strong><br><div class="mt-2">Case ID: ${foundCases[0].case_id}</div><div class="mt-1">An authorized investigator has verified a potential match associated with your case.</div><div class="mt-3 d-flex gap-2"><button class="btn btn-primary btn-sm" onclick="viewCase(${foundCases[0].id})">View Case</button><button class="btn btn-outline-primary btn-sm" onclick="go('notifications')">View Timeline</button></div></div></div>`;}}catch(e){}el.innerHTML=heading('Good day, '+me.name.split(' ')[0],'A live overview of your authorized JanRaksha activity.')+`<div class="stat-grid"><div class="stat"><i class="fa-solid fa-folder-open"></i><small>Total cases</small><h2>${s.total_cases}</h2></div><div class="stat"><i class="fa-solid fa-person-circle-question"></i><small>Active cases</small><h2>${s.active_cases}</h2></div><div class="stat"><i class="fa-solid fa-eye"></i><small>New sightings</small><h2>${s.new_sightings}</h2></div><div class="stat"><i class="fa-solid fa-wand-magic-sparkles"></i><small>Potential matches</small><h2>${s.potential_matches}</h2></div></div>${caseUpdate}<div class="panel"><h4>Responsible AI</h4><div class="alert-ai">Similarity scores are AI-assisted leads only. They must never be treated as identity confirmation without authorized human review.</div></div><div class="panel"><h4>Quick actions</h4><button class="btn btn-primary btn-sm me-2" onclick="go('register-case')">Register a case</button><button class="btn btn-outline-primary btn-sm" onclick="go('search')">AI photo search</button></div>`}
 async function gallery(el){let r=await api('/api/missing-persons');cases=r.items;el.innerHTML=heading('Missing persons','Search authorized case records and follow active leads.')+`<input id="caseSearch" placeholder="Search by name, case ID or location"><div id="cards" class="case-grid mt-3"></div>`;let render=()=>{$('#cards').innerHTML=cases.filter(p=>(p.name+p.case_id+(p.last_seen_location||'')).toLowerCase().includes($('#caseSearch').value.toLowerCase())).map(card).join('')||'<div class="empty">No matching cases.</div>'};$('#caseSearch').oninput=render;render()}
 const card=p=>`<article class="case-card"><img src="${p.photo||''}" alt="Photo for ${p.name}"><div class="inner"><span class="badge-status">${p.status}</span><h4 class="mt-2">${p.name}</h4><small class="text-muted">${p.case_id} · ${p.age||'—'} years · ${p.gender||'—'}</small><p class="small mt-2 mb-2"><i class="fa-solid fa-location-dot"></i> ${p.last_seen_location||'Location restricted'}</p><button class="btn btn-outline-primary btn-sm" onclick="viewCase(${p.id})">View case</button></div></article>`;
-async function viewCase(id){let r=await api('/api/missing-persons/'+id),p=r.person;$('#page').innerHTML=heading(p.name,p.case_id)+`<div class="panel"><div class="row g-4"><div class="col-md-3"><img class="img-fluid rounded" src="${p.photo}" alt="${p.name}"></div><div class="col-md-9"><span class="badge-status">${String(p.status).replace(/_/g,' ')}</span><h4 class="mt-2">Last seen: ${p.last_seen_location||'Not shared'}</h4><p>${p.description||'No additional public description.'}</p>${['INVESTIGATOR','ADMIN_DEMO'].includes(me.role)?`<select id="status"><option>${String(p.status).replace(/_/g,' ')}</option><option>ACTIVE</option><option>UNDER REVIEW</option><option>RELEVANT LEAD</option><option>PERSON FOUND</option><option>PERSON_FOUND</option><option>CLOSED</option></select><button class="btn btn-primary btn-sm mt-2" onclick="updateStatus(${p.id})">Update status</button><textarea id="note" placeholder="Restricted investigation note"></textarea><button class="btn btn-outline-primary btn-sm mt-2" onclick="addNote('${p.case_id}')">Add note</button>`:''}</div></div></div><div class="panel"><h4>Investigation timeline</h4><div class="timeline">${r.timeline.map(x=>`<div class="event"><b>${x.event_type.replaceAll('_',' ')}</b><br><span class="text-muted small">${new Date(x.created_at).toLocaleString()} · ${x.description}</span></div>`).join('')||'No events yet.'}</div></div>`}
+async function viewCase(id){let r=await api('/api/missing-persons/'+id),p=r.person;$('#page').innerHTML=heading(p.name,p.case_id)+`<div class="panel"><div class="row g-4"><div class="col-md-3"><img class="img-fluid rounded" src="${p.photo}" alt="${p.name}"></div><div class="col-md-9"><span class="badge-status">${String(p.status).replace(/_/g,' ')}</span><h4 class="mt-2">Last seen: ${p.last_seen_location||'Not shared'}</h4><p>${p.description||'No additional public description.'}</p>${['INVESTIGATOR','ADMIN_DEMO','FAMILY_USER','CITIZEN'].includes(me.role)?`<select id="status"><option>${String(p.status).replace(/_/g,' ')}</option><option>ACTIVE</option><option>UNDER REVIEW</option><option>RELEVANT LEAD</option><option>PERSON FOUND</option><option>PERSON_FOUND</option><option>CLOSED</option></select><button class="btn btn-primary btn-sm mt-2" onclick="updateStatus(${p.id})">Update status</button><textarea id="note" placeholder="Restricted investigation note"></textarea><button class="btn btn-outline-primary btn-sm mt-2" onclick="addNote('${p.case_id}')">Add note</button>`:''}</div></div></div><div class="panel"><h4>Investigation timeline</h4><div class="timeline">${r.timeline.map(x=>`<div class="event"><b>${x.event_type.replaceAll('_',' ')}</b><br><span class="text-muted small">${new Date(x.created_at).toLocaleString()} · ${x.description}</span></div>`).join('')||'No events yet.'}</div></div>`}
 async function updateStatus(id){try{await api('/api/missing-persons/'+id,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({status:$('#status').value})});toast('Case status updated.');viewCase(id)}catch(e){toast(e.message)}}async function addNote(caseId){try{await api('/api/cases/'+caseId+'/notes',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({body:$('#note').value})});toast('Restricted note added.')}catch(e){toast(e.message)}}
 
 async function openInvestigatorMatch(matchId){
@@ -347,8 +447,8 @@ async function openInvestigatorMatch(matchId){
       <div class="auth-modal" style="display:flex;align-items:center;justify-content:center;position:fixed;inset:0;background:rgba(0,0,0,0.45);z-index:1000;">
         <div class="auth-box" style="max-width:560px;">
           <h2>Verify Potential Match</h2>
-          <p>You are about to verify this potential match. Confirm that you have reviewed the available information and believe the submitted person corresponds to the missing-person case.</p>
-          <textarea id="verification-notes" class="form-control mb-3" rows="4" placeholder="Investigator verification notes"></textarea>
+          <p>You are about to verify this potential match. Review the available information and confirm whether the person corresponds to the missing-person case.</p>
+          <textarea id="verification-notes" class="form-control mb-3" rows="4" placeholder="Human verification notes"></textarea>
           <label class="check mb-3"><input id="verification-confirmation" type="checkbox"> I have reviewed the AI-assisted result and supporting case information.</label>
           <div class="d-flex justify-content-end gap-2">
             <button type="button" class="btn btn-outline-secondary" id="cancel-verification">Cancel</button>
@@ -365,17 +465,26 @@ async function openInvestigatorMatch(matchId){
     document.getElementById('confirm-verification').addEventListener('click', async ()=> {
       const notes = document.getElementById('verification-notes').value.trim();
       if (!notes) {
-        toast('Verification notes are required.');
+        window.alert('Please enter human verification notes before confirming.');
         return;
       }
-      const result = await api('/api/matches/' + matchId + '/verify', {
+      const confirmButton = document.getElementById('confirm-verification');
+      confirmButton.disabled = true;
+      const verificationRequest = api('/api/matches/' + matchId + '/verify', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({ decision: 'VERIFIED', notes })
       });
-      toast(result.message || '✓ Match Verified Successfully');
       verificationModal.classList.add('d-none');
-      setTimeout(() => go('dashboard'), 350);
+      window.alert('Verification confirmed.');
+      try {
+        await verificationRequest;
+        setTimeout(() => go('dashboard'), 350);
+      } catch (error) {
+        toast(`Verification could not be saved: ${error.message || 'request failed.'}`);
+        verificationModal.classList.remove('d-none');
+        confirmButton.disabled = false;
+      }
     });
 
     document.getElementById('verify-match-btn').addEventListener('click', ()=> verificationModal.classList.remove('d-none'));
@@ -395,20 +504,19 @@ async function openInvestigatorMatch(matchId){
 }
 
 function personFields(){return `<label>Full name<input name="name" required></label><div class="row"><div class="col"><label>Age<input name="age" type="number" min="0"></label></div><div class="col"><label>Gender<select name="gender"><option>Not specified</option><option>Female</option><option>Male</option><option>Other</option></select></label></div></div><label>Photograph<div class="drop"><i class="fa-solid fa-cloud-arrow-up"></i> JPG or PNG, max 5 MB<input name="photo" type="file" accept="image/png,image/jpeg" required></div></label>`}
-function caseForm(el){if(!['FAMILY_USER','INVESTIGATOR','ADMIN_DEMO'].includes(me.role)){el.innerHTML=heading('Register missing person')+'<div class="alert alert-warning">Your role cannot register cases.</div>';return}el.innerHTML=heading('Register missing person','Create a secure case. The system will create the case ID and embedding.')+`<form id="caseForm" class="panel form-panel">${personFields()}<label>Last-seen location<input name="last_seen_location" required></label><div class="row"><div class="col"><label>Latitude<input name="latitude" type="number" step="any"></label></div><div class="col"><label>Longitude<input name="longitude" type="number" step="any"></label></div></div><div class="row"><div class="col"><label>Date<input name="last_seen_date" type="date"></label></div><div class="col"><label>Time<input name="last_seen_time" type="time"></label></div></div><label>Description<textarea name="description"></textarea></label><label>Clothing description<textarea name="clothing_description"></textarea></label><button class="btn btn-primary">Create case and process photo</button></form>`;$('#caseForm').onsubmit=e=>submitForm(e,'/api/missing-persons',r=>{toast(r.message);viewCase(r.person.id)})}
-function renderMatchGrid(matches, isFound=false, reportId=null){if(!matches.length){return '<div class="empty">No potential matches found.</div>'}const ranked=matches.map(match=>({item:match.case||match.person||match,score:Number(match.similarity_score)||0})).sort((a,b)=>b.score-a.score);return `<div class="match-comparison">${ranked.map(({item,score},index)=>{const percent=Math.min(100,Math.max(0,score));const label=Number.isInteger(score)?score:score.toFixed(1);const action=isFound?`<div class="match-actions"><input id="verifyLocation-${item.case_id}" class="mb-2" placeholder="Verified location" value="${document.querySelector('#foundForm input[name=\'location_name\']')?.value||''}"><div class="d-flex gap-2"><button class="btn btn-sm btn-primary" onclick="verifyFoundReport(${reportId}, '${item.case_id}', true)">Yes, verified</button><button class="btn btn-sm btn-outline-secondary" onclick="verifyFoundReport(${reportId}, '${item.case_id}', false)">No, not this person</button></div></div>`:`<button class="btn btn-link btn-sm p-0" onclick="viewCase(${item.id})">View case</button>`;return `<article class="match-row"><div class="match-rank" aria-label="Rank ${index+1}">${index+1}</div><img class="match-photo" src="${item.photo||''}" alt="Photo for ${item.name||'potential match'}"><div class="match-details"><div class="match-heading"><div><h5>${item.name||'Unknown person'}</h5><small>${item.case_id||''} · ${item.age??'—'} yrs · ${item.last_seen_location||'Location not shared'}</small></div><strong class="score-pill">${label}%</strong></div><div class="score-panel"><div class="score-labels"><span>Similarity score</span><strong>${label}%</strong></div><div class="score-bar" role="meter" aria-label="Similarity score" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${percent}"><span class="score-fill" style="width:${percent}%"></span></div></div><div class="match-footer"><span class="badge-status">${item.status||'POTENTIAL MATCH'}</span>${action}</div></div></article>`}).join('')}</div>`;}
+function caseForm(el){if(!['FAMILY_USER','INVESTIGATOR','ADMIN_DEMO'].includes(me.role)){el.innerHTML=heading('Register missing person')+'<div class="alert alert-warning">Your role cannot register cases.</div>';return}el.innerHTML=heading('Register missing person','Create a secure case. The system will create the case ID and embedding.')+`<form id="caseForm" class="panel form-panel">${personFields()}<label>Last-seen location<input name="last_seen_location" required></label><div class="row"><div class="col"><label>Date<input name="last_seen_date" type="date"></label></div><div class="col"><label>Time<input name="last_seen_time" type="time"></label></div></div><label>Description<textarea name="description"></textarea></label><label>Clothing description<textarea name="clothing_description"></textarea></label><button class="btn btn-primary">Create case and process photo</button></form>`;$('#caseForm').onsubmit=e=>submitForm(e,'/api/missing-persons',r=>{toast(r.message);viewCase(r.person.id)})}
+function renderMatchGrid(matches, isFound=false, reportId=null, isWebcam=false){if(!matches.length){return '<div class="empty">No potential matches found.</div>'}const ranked=matches.map(match=>({item:match.case||match.person||match,score:Number(match.similarity_score)||0,matchId:match.match_id})).sort((a,b)=>b.score-a.score);return `<div class="match-comparison">${ranked.map(({item,score,matchId},index)=>{const percent=Math.min(100,Math.max(0,score));const label=Number.isInteger(score)?score:score.toFixed(1);const action=isFound?`<div class="match-actions"><input id="verifyLocation-${item.case_id}" class="mb-2" placeholder="Verified location" value="${document.querySelector('#foundForm input[name=\'location_name\']')?.value||''}"><div class="d-flex gap-2"><button class="btn btn-sm btn-primary" onclick="verifyFoundReport(${reportId}, '${item.case_id}', true)">Yes, verified</button><button class="btn btn-sm btn-outline-secondary" onclick="verifyFoundReport(${reportId}, '${item.case_id}', false)">No, not this person</button></div></div>`:isWebcam?(['INVESTIGATOR','ADMIN_DEMO','FAMILY_USER','CITIZEN'].includes(me.role)?`<button type="button" class="btn btn-sm btn-outline-primary" data-webcam-verify data-case-id="${item.case_id}">Verify this match</button>`:'<span class="webcam-review-note">Requires authorized human review</span>'):`<button class="btn btn-link btn-sm p-0" onclick="viewCase(${item.id})">View case</button>`;const caseDetails=isWebcam?`${item.age??'—'} yrs · ${item.last_seen_location||'Location not shared'}`:`${item.case_id||''} · ${item.age??'—'} yrs · ${item.last_seen_location||'Location not shared'}`;const badge=isWebcam&&matchId?'HUMAN VERIFICATION REQUIRED':isWebcam&&item.status==='LOW_CONFIDENCE_LEAD'?'LOW CONFIDENCE · HUMAN REVIEW REQUIRED':item.status||'POTENTIAL MATCH';return `<article class="match-row"><div class="match-rank" aria-label="Rank ${index+1}">${index+1}</div><img class="match-photo" src="${item.photo||''}" alt="Photo for ${item.name||'potential match'}"><div class="match-details"><div class="match-heading"><div><h5>${item.name||'Unknown person'}</h5><small>${caseDetails}</small></div><strong class="score-pill">${label}%</strong></div><div class="score-panel"><div class="score-labels"><span>Similarity score</span><strong>${label}%</strong></div><div class="score-bar" role="meter" aria-label="Similarity score" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${percent}"><span class="score-fill" style="width:${percent}%"></span></div></div><div class="match-footer"><span class="badge-status">${badge}</span>${action}</div></div></article>`}).join('')}</div>`;}
 function search(el){el.innerHTML=heading('AI photo search','Upload a photo to search authorized missing-person embeddings.')+`<div class="alert-ai">AI-generated results are potential leads and require human verification. A similarity score is not an identity decision.</div><form id="searchForm" class="panel form-panel"><label>Query photograph<input name="photo" type="file" accept="image/png,image/jpeg" required></label><label>Exclude existing case ID (optional)<input name="exclude_case_id" placeholder="JR-2026-0001"></label><button class="btn btn-primary">Process and search</button></form><div id="results"></div>`;$('#searchForm').onsubmit=e=>submitForm(e,'/api/ai/search',r=>{$('#results').innerHTML=`<div class="panel"><h4>Ranked potential matches</h4><p class="small text-muted">Sorted by AI similarity score. Results are leads, not identity confirmation.</p>${r.chart?`<img class="match-chart" src="${r.chart}" alt="Seaborn chart comparing similarity scores by case">`:''}${renderMatchGrid(r.matches, false)}</div>`})}
-function sightingForm(el){el.innerHTML=heading('Report a sighting','Submit a lead for authorized review. Location details are access controlled.')+`<form id="sightingForm" class="panel form-panel"><label>Related case ID<input name="case_id" placeholder="JR-2026-0001" required></label><label>Photo (optional)<input name="photo" type="file" accept="image/png,image/jpeg"></label><label>Description<textarea name="description" required></textarea></label><label>Location name<input name="location_name" required></label><div class="row"><div class="col"><label>Latitude<input name="latitude" type="number" step="any"></label></div><div class="col"><label>Longitude<input name="longitude" type="number" step="any"></label></div></div><button class="btn btn-primary">Submit sighting</button></form>`;$('#sightingForm').onsubmit=e=>submitForm(e,'/api/sightings',r=>toast(r.message))}
-function foundForm(el){el.innerHTML=heading('Report found person','This creates an AI-assisted lead only. Citizens cannot mark a case as found without human verification.')+`<form id="foundForm" class="panel form-panel"><label>Photograph<input name="photo" type="file" accept="image/png,image/jpeg" required></label><label>Exclude existing case ID (optional)<input name="exclude_case_id" placeholder="JR-2026-0001"></label><label>Description<textarea name="description"></textarea></label><label>Current location<input name="location_name" required></label><div class="row"><div class="col"><label>Latitude<input name="latitude" type="number" step="any"></label></div><div class="col"><label>Longitude<input name="longitude" type="number" step="any"></label></div></div><button class="btn btn-primary">Submit and find potential matches</button></form><div id="foundResults"></div>`;$('#foundForm').onsubmit=e=>submitForm(e,'/api/found-persons',r=>{$('#foundResults').innerHTML=`<div class="panel"><h4>Ranked potential matches</h4><p class="small text-muted">A human must confirm the match before any email alert is sent.</p>${r.chart?`<img class="match-chart" src="${r.chart}" alt="Seaborn chart comparing similarity scores by case">`:''}${renderMatchGrid(r.matches, true, r.report_id)}</div>`;toast(r.message)})}
+function sightingForm(el){el.innerHTML=heading('Report a sighting','Submit a lead for authorized review. Location details are access controlled.')+`<form id="sightingForm" class="panel form-panel"><label>Related case ID<input name="case_id" placeholder="JR-2026-0001" required></label><label>Photo (optional)<input name="photo" type="file" accept="image/png,image/jpeg"></label><label>Description<textarea name="description" required></textarea></label><label>Location name<input name="location_name" required></label><button class="btn btn-primary">Submit sighting</button></form>`;$('#sightingForm').onsubmit=e=>submitForm(e,'/api/sightings',r=>toast(r.message))}
+function foundForm(el){el.innerHTML=heading('Report found person','This creates an AI-assisted lead only. Citizens cannot mark a case as found without human verification.')+`<form id="foundForm" class="panel form-panel"><label>Photograph<input name="photo" type="file" accept="image/png,image/jpeg" required></label><label>Exclude existing case ID (optional)<input name="exclude_case_id" placeholder="JR-2026-0001"></label><label>Description<textarea name="description"></textarea></label><label>Current location<input name="location_name" required></label><button class="btn btn-primary">Submit and find potential matches</button></form><div id="foundResults"></div>`;$('#foundForm').onsubmit=e=>submitForm(e,'/api/found-persons',r=>{$('#foundResults').innerHTML=`<div class="panel"><h4>Ranked potential matches</h4><p class="small text-muted">A human must confirm the match before any email alert is sent.</p>${r.chart?`<img class="match-chart" src="${r.chart}" alt="Seaborn chart comparing similarity scores by case">`:''}${renderMatchGrid(r.matches, true, r.report_id)}</div>`;toast(r.message)})}
 async function verifyFoundReport(reportId, caseId, verified){const locationInput=document.getElementById('verifyLocation-'+caseId);const payload={case_id:caseId,verified};if(verified){payload.location_name=(locationInput&&locationInput.value.trim())||document.querySelector('#foundForm input[name="location_name"]').value.trim();if(!payload.location_name){toast('Please add the verified location before confirming.');return;}}try{const result=await api(`/api/found-persons/${reportId}/verify`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});toast(result.message);if(verified){go('dashboard');}else{const foundPanel=document.querySelector('#foundResults');if(foundPanel)foundPanel.scrollIntoView({behavior:'smooth'});}}catch(e){toast(e.message)}}
 async function map(el){let r=await api('/api/maps/events');el.innerHTML=heading('Investigation map','Approximate authorized event locations only.')+`<div class="panel"><div id="mapEvents">${r.events.map(x=>`<div class="result"><i class="fa-solid ${x.type==='sighting'?'fa-eye':'fa-location-dot'}"></i><div><b>${x.case_id}</b><br><small>${x.type.replace('_',' ')} · ${x.location||'Location unavailable'}</small></div><span class="badge-status">${x.status}</span></div>`).join('')||'<div class="empty">No location events available.</div>'}</div></div>`}
 async function notifications(el){let r=await api('/api/notifications');el.innerHTML=heading('Notifications','Your case and workflow updates.')+`<div class="panel">${r.items.map(n=>`<div class="result"><i class="fa-solid fa-bell"></i><div><b>${n.title}</b><br><small>${n.message}<br>${new Date(n.created_at).toLocaleString()}</small></div>${!n.is_read?`<button class="btn btn-sm btn-outline-primary" onclick="markRead(${n.id})">Mark read</button>`:''}</div>`).join('')||'<div class="empty">No notifications.</div>'}</div>`}async function markRead(id){await api('/api/notifications/'+id+'/read',{method:'PUT'});go('notifications')}
-async function emergency(el){
+async function emergency(el, centerOnly=false){
   const dataLoads=await Promise.allSettled([
     api('/api/emergency-contacts'),
     api('/api/trusted-contacts'),
-    api('/api/emergency/history'),
-    api('/api/emergency/cases/mine')
+    api('/api/emergency/history')
   ]);
   const loadErrors=[];
   const dataOrEmpty=(result,label)=>{
@@ -419,29 +527,46 @@ async function emergency(el){
   const contacts=dataOrEmpty(dataLoads[0],'Community contacts');
   const trusted=dataOrEmpty(dataLoads[1],'Trusted contacts');
   const history=dataOrEmpty(dataLoads[2],'Safety alert history');
-  const reports=dataOrEmpty(dataLoads[3],'Submitted report history');
   const admin=me.role==='ADMIN_DEMO';
   const defaultServices=[{name:'Accident',category:'ACCIDENT',icon:'fa-car-crash',tone:'accident'},{name:'Fire',category:'FIRE',icon:'fa-fire-flame-curved',tone:'fire'},{name:'Women Safety',category:'WOMEN_SAFETY',icon:'fa-person-dress',tone:'women'},{name:'Child Safety',category:'CHILD_SAFETY',icon:'fa-child-reaching',tone:'child'}];
   const serviceCards=defaultServices.map(service=>`<button type="button" class="safety-service-card ${service.tone}" data-emergency-category="${service.category}"><span class="safety-service-icon"><i class="fa-solid ${service.icon}"></i></span><span class="safety-service-label">${service.name}</span></button>`).join('');
-  const primaryContact=contacts.items.find(x=>x.phone&&x.phone!=='CONFIGURE')||contacts.items[0];
-  const primaryPhone=primaryContact?primaryContact.phone:'';
-  const serviceButton=primaryPhone?`<a class="btn btn-danger btn-block emergency-call-btn" href="tel:${primaryPhone.replace(/[^+0-9]/g,'')}">Call Emergency Services</a>`:'<button class="btn btn-danger btn-block emergency-call-btn" type="button" disabled>Call Emergency Services</button>';
-  const reportHistory=reports.items.map(item=>`<div class="result"><div><b>${escapeHtml(item.case_id)} · ${escapeHtml(item.category.replaceAll('_',' '))}</b><br><small>${escapeHtml(item.location_name)} · ${new Date(item.created_at).toLocaleString()}</small></div><span class="badge-status">${escapeHtml(item.status.replaceAll('_',' '))}</span></div>`).join('')||'<div class="empty">No emergency reports submitted yet.</div>';
+  const serviceButton='<a class="btn btn-danger btn-block emergency-call-btn" href="tel:112">Call Emergency Services (112)</a>';
   const loadWarning=loadErrors.length?`<div class="alert alert-warning">Some supporting information could not be loaded. You can still submit an incident report.<br>${loadErrors.map(escapeHtml).join('<br>')}</div>`:'';
-  el.innerHTML=heading('Safety Community','Emergency support, quick assistance, and trusted alert access for your area.')+loadWarning+`<div class="safety-community-shell"><div class="safety-community-header"><i class="fa-solid fa-triangle-exclamation"></i> Safety Community</div><p class="text-muted mb-3">Choose an incident type to open the report form.</p><div class="safety-grid">${serviceCards}</div><div class="safety-community-footer"><span>Call Emergency Services</span>${serviceButton}</div></div>
-  <form id="emergencyReportForm" class="panel form-panel d-none"><h4>Report <span id="emergencyReportCategory"></span></h4><input name="category" id="emergencyCategory" type="hidden"><input name="submission_key" id="emergencySubmissionKey" type="hidden"><div class="row"><div class="col"><label>Your name<input name="reporter_name" maxlength="120" value="${escapeHtml(me.name)}" required></label></div><div class="col"><label>Phone or email<input name="reporter_contact" maxlength="160" value="${escapeHtml(me.phone||me.email)}"></label></div></div><label>Incident description<textarea name="description" maxlength="5000" required></textarea></label><label>Incident location<input name="location_name" id="reportLocation" maxlength="200" placeholder="Enter location or nearby landmark" required></label><input name="latitude" id="reportLatitude" type="hidden"><input name="longitude" id="reportLongitude" type="hidden"><label>Supporting image (optional)<input name="attachment" type="file" accept="image/png,image/jpeg"></label><div id="emergencyReportMessage" role="status" aria-live="polite"></div><button class="btn btn-primary" type="submit">Submit emergency report</button> <button class="btn btn-link" type="button" id="cancelEmergencyReport">Cancel</button></form>
-  <div class="panel form-panel"><h4>My emergency reports</h4>${reportHistory}</div>
-  <div class="panel form-panel"><h4><i class="fa-solid fa-triangle-exclamation text-danger"></i> Activate safety alert</h4><p>Use only when you feel unsafe or need immediate assistance. Your trusted contacts receive an email alert with your shared location when email delivery is configured.</p><label>Safety message<textarea id="sosMessage">I activated a safety alert and need assistance.</textarea></label><label>Location name<input id="sosLocation" placeholder="Getting your location…"></label><input id="sosLat" type="hidden"><input id="sosLng" type="hidden"><button id="sosButton" class="btn btn-danger">Send safety alert</button></div>
-  <div class="panel form-panel"><h4>Safety community contacts</h4>${contacts.items.map(x=>`<div class="result"><i class="fa-solid fa-phone-volume"></i><div><b>${x.name}</b><br><small>${x.region||''}<br>${x.instructions||''}</small></div>${x.phone==='CONFIGURE'?'<span class="badge-status">Needs configuration</span>':`<a class="btn btn-danger ms-auto" href="tel:${x.phone.replace(/[^+0-9]/g,'')}">Call ${x.phone}</a>`}</div>`).join('')||'<div class="empty">No verified safety contacts configured.</div>'}</div>
-  <div class="panel form-panel"><h4>Trusted contacts</h4><div>${trusted.items.map(x=>`<div class="result"><div><b>${x.name}</b><br><small>${x.email||x.phone}</small></div><button class="btn btn-sm btn-outline-danger ms-auto" onclick="removeTrusted(${x.id})">Remove</button></div>`).join('')||'<div class="empty">No trusted contacts yet.</div>'}</div><form id="trustedForm"><label>Name<input name="name" required></label><label>Email<input name="email" type="email"></label><label>Phone<input name="phone"></label><button class="btn btn-outline-primary">Add trusted contact</button></form></div>
-  <div class="panel form-panel"><h4>Safety alerts history</h4>${history.items.map(x=>`<div class="result"><div><b>Alert #${x.id} · ${x.status}</b><br><small>${x.location_name||'Location unavailable'} · ${new Date(x.created_at).toLocaleString()}</small></div>${x.status==='ACTIVE'?`<button class="btn btn-outline-danger ms-auto" onclick="cancelSOS(${x.id})">Cancel alert</button>`:''}</div>`).join('')||'<div class="empty">No safety alerts yet.</div>'}</div>${admin?`<form id="contactForm" class="panel form-panel"><h4>Configure community contact</h4><label>Name<input name="name" required></label><label>Phone<input name="phone" required></label><label>Region<input name="region" required></label><label>Instructions<textarea name="instructions"></textarea></label><button class="btn btn-primary">Save contact</button></form>`:''}`;
-  document.querySelectorAll('[data-emergency-category]').forEach(button=>button.onclick=()=>{const form=$('#emergencyReportForm');$('#emergencyCategory').value=button.dataset.emergencyCategory;$('#emergencyReportCategory').textContent=button.querySelector('.safety-service-label').textContent;$('#emergencySubmissionKey').value=crypto.randomUUID?crypto.randomUUID():`${Date.now()}-${Math.random().toString(16).slice(2)}`;form.classList.remove('d-none');form.scrollIntoView({behavior:'smooth',block:'center'})});
-  $('#cancelEmergencyReport').onclick=()=>$('#emergencyReportForm').classList.add('d-none');
-  $('#emergencyReportForm').onsubmit=async event=>{event.preventDefault();const form=event.target,button=form.querySelector('button[type="submit"]');button.disabled=true;button.textContent='Submitting…';$('#emergencyReportMessage').textContent='';try{const result=await api('/api/emergency/cases',{method:'POST',body:new FormData(form)});$('#emergencyReportMessage').innerHTML=`<div class="alert alert-success">${escapeHtml(result.message)} Case ID: <strong>${escapeHtml(result.case.case_id)}</strong></div>`;toast(result.message);setTimeout(()=>emergency(el),800)}catch(error){$('#emergencyReportMessage').innerHTML=`<div class="alert alert-danger">${escapeHtml(error.message)}</div>`;button.disabled=false;button.textContent='Submit emergency report'}};
-  if(navigator.geolocation)navigator.geolocation.getCurrentPosition(position=>{const coords=`Current location (${position.coords.latitude.toFixed(5)}, ${position.coords.longitude.toFixed(5)})`;$('#sosLat').value=position.coords.latitude;$('#sosLng').value=position.coords.longitude;$('#sosLocation').value=coords;$('#reportLatitude').value=position.coords.latitude;$('#reportLongitude').value=position.coords.longitude;if(!$('#reportLocation').value)$('#reportLocation').value=coords},()=>{$('#sosLocation').placeholder='Location unavailable; enter a safe description'});
-  $('#sosButton').onclick=async()=>{try{let r=await api('/api/emergency/sos',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:$('#sosMessage').value,location_name:$('#sosLocation').value,latitude:$('#sosLat').value||null,longitude:$('#sosLng').value||null})});toast(r.message);emergency(el)}catch(x){toast(x.message)}};
-  $('#trustedForm').onsubmit=async e=>{e.preventDefault();try{await api('/api/trusted-contacts',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(Object.fromEntries(new FormData(e.target)))});toast('Trusted contact added.');emergency(el)}catch(x){toast(x.message)}};
-  if(admin)$('#contactForm').onsubmit=e=>{e.preventDefault();api('/api/emergency-contacts',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(Object.fromEntries(new FormData(e.target)))}).then(()=>{toast('Safety contact saved.');emergency(el)}).catch(x=>toast(x.message))};
+  const supportSections=`<div class="panel form-panel"><h4><i class="fa-solid fa-triangle-exclamation text-danger"></i> Activate safety alert</h4><p>Use only when you feel unsafe or need immediate assistance. Email alerts go to your registered account and trusted contacts when email delivery is configured.</p><label>Safety message<textarea id="sosMessage">I activated a safety alert and need assistance.</textarea></label><label>Location name<input id="sosLocation" placeholder="Getting your location…"></label><input id="sosLat" type="hidden"><input id="sosLng" type="hidden"><button id="sosButton" class="btn btn-danger">Send safety alert</button><div class="mt-3"><button type="button" id="enablePhoneNotifications" class="btn btn-outline-primary">Enable phone notifications</button><p id="phoneNotificationStatus" class="small text-muted mt-2 mb-0">Enable this on every phone or browser that should receive JanRaksha alerts. iPhone users must add the site to the Home Screen first.</p></div></div>
+  <div class="panel form-panel"><h4>Safety community contacts</h4>${contacts.items.map(x=>`<div class="result"><i class="fa-solid fa-phone-volume"></i><div><b>${escapeHtml(x.name)}</b><br><small>${escapeHtml(x.region||'')}<br>${escapeHtml(x.instructions||'')}</small></div>${x.phone==='CONFIGURE'?'<span class="badge-status">Needs configuration</span>':`<a class="btn btn-danger ms-auto" href="tel:${x.phone.replace(/[^+0-9]/g,'')}">Call ${escapeHtml(x.phone)}</a>`}</div>`).join('')||'<div class="empty">No verified safety contacts configured.</div>'}</div>
+  <div class="panel form-panel"><h4>Trusted contacts</h4><div>${trusted.items.map(x=>`<div class="result"><div><b>${escapeHtml(x.name)}</b><br><small>${escapeHtml(x.email||x.phone)}</small></div><button class="btn btn-sm btn-outline-danger ms-auto" onclick="removeTrusted(${x.id}, '${centerOnly?'emergency-center':'emergency'}')">Remove</button></div>`).join('')||'<div class="empty">No trusted contacts yet.</div>'}</div><form id="trustedForm"><label>Name<input name="name" required></label><label>Email<input name="email" type="email"></label><label>Phone<input name="phone"></label><button class="btn btn-outline-primary">Add trusted contact</button></form></div>
+  <div class="panel form-panel"><h4>Safety alerts history</h4>${history.items.map(x=>`<div class="result"><div><b>Alert #${x.id} · ${escapeHtml(x.status)}</b><br><small>${escapeHtml(x.location_name||'Location unavailable')} · ${new Date(x.created_at).toLocaleString()}</small></div>${x.status==='ACTIVE'?`<button class="btn btn-outline-danger ms-auto" onclick="cancelSOS(${x.id}, '${centerOnly?'emergency-center':'emergency'}')">Cancel alert</button>`:''}</div>`).join('')||'<div class="empty">No safety alerts yet.</div>'}</div>${admin?`<form id="contactForm" class="panel form-panel"><h4>Configure community contact</h4><label>Name<input name="name" required></label><label>Phone<input name="phone" required></label><label>Region<input name="region" required></label><label>Instructions<textarea name="instructions"></textarea></label><button class="btn btn-primary">Save contact</button></form>`:''}`;
+  if(centerOnly){
+    el.innerHTML=heading('Emergency','Activate a safety alert and manage community and trusted contacts.')+loadWarning+
+      `<button type="button" class="btn btn-outline-primary mb-3" id="openSafetyCommunity"><i class="fa-solid fa-people-group"></i> Safety Community reports</button>${supportSections}`;
+  }else{
+    const emergencyCard='<button type="button" class="safety-service-card emergency" data-open-emergency-center><span class="safety-service-icon"><i class="fa-solid fa-kit-medical"></i></span><span class="safety-service-label">Emergency</span></button>';
+    el.innerHTML=heading('Safety Community','Emergency support, quick assistance, and trusted alert access for your area.')+loadWarning+`<div class="safety-community-shell"><div class="safety-community-header"><i class="fa-solid fa-triangle-exclamation"></i> Safety Community</div><p class="text-muted mb-3">Choose an incident type to open the report form.</p><div class="safety-grid">${serviceCards}${emergencyCard}</div><div class="safety-community-footer"><span>Call Emergency Services</span>${serviceButton}</div></div>
+  <form id="emergencyReportForm" class="panel form-panel d-none"><h4>Report <span id="emergencyReportCategory"></span></h4><input name="category" id="emergencyCategory" type="hidden"><input name="submission_key" id="emergencySubmissionKey" type="hidden"><div class="row"><div class="col"><label>Your name<input name="reporter_name" maxlength="120" value="${escapeHtml(me.name)}" required></label></div><div class="col"><label>Phone or email<input name="reporter_contact" maxlength="160" value="${escapeHtml(me.phone||me.email)}"></label></div></div><label>Incident description<textarea name="description" maxlength="5000" required></textarea></label><label>Incident location<input name="location_name" id="reportLocation" maxlength="200" placeholder="Enter location or nearby landmark" required></label><label>Supporting image (optional)<input name="attachment" type="file" accept="image/png,image/jpeg"></label><div id="emergencyReportMessage" role="status" aria-live="polite"></div><button class="btn btn-primary" type="submit">Submit emergency report</button> <button class="btn btn-link" type="button" id="cancelEmergencyReport">Cancel</button></form>
+  `;
+  }
+  if(centerOnly){
+    $('#openSafetyCommunity').onclick=()=>go('emergency-community');
+    const pushButton=$('#enablePhoneNotifications'),pushStatus=$('#phoneNotificationStatus');
+    pushButton.disabled=true;pushStatus.textContent='Preparing phone notification setup…';
+    phonePushSetup=preparePhonePush();
+    phonePushSetup.then(()=>{pushButton.disabled=false;pushStatus.textContent='Ready to enable notifications on this phone or browser.'}).catch(error=>{pushStatus.textContent=error.message});
+    pushButton.onclick=event=>enablePhoneNotifications(event.currentTarget);
+  }
+  const refreshCurrent=()=>emergency(el,centerOnly);
+  const emergencyCenterButton=document.querySelector('[data-open-emergency-center]');
+  if(emergencyCenterButton)emergencyCenterButton.onclick=()=>go('emergency-center');
+  if(!centerOnly){
+    document.querySelectorAll('[data-emergency-category]').forEach(button=>button.onclick=()=>{const form=$('#emergencyReportForm');$('#emergencyCategory').value=button.dataset.emergencyCategory;$('#emergencyReportCategory').textContent=button.querySelector('.safety-service-label').textContent;$('#emergencySubmissionKey').value=crypto.randomUUID?crypto.randomUUID():`${Date.now()}-${Math.random().toString(16).slice(2)}`;form.classList.remove('d-none');form.scrollIntoView({behavior:'smooth',block:'center'})});
+    $('#cancelEmergencyReport').onclick=()=>$('#emergencyReportForm').classList.add('d-none');
+    $('#emergencyReportForm').onsubmit=async event=>{event.preventDefault();const form=event.target,button=form.querySelector('button[type="submit"]');button.disabled=true;button.textContent='Submitting…';$('#emergencyReportMessage').textContent='';try{const result=await api('/api/emergency/cases',{method:'POST',body:new FormData(form)});$('#emergencyReportMessage').innerHTML=`<div class="alert alert-success">${escapeHtml(result.message)} Case ID: <strong>${escapeHtml(result.case.case_id)}</strong></div>`;toast(result.message);setTimeout(()=>emergency(el),800)}catch(error){$('#emergencyReportMessage').innerHTML=`<div class="alert alert-danger">${escapeHtml(error.message)}</div>`;button.disabled=false;button.textContent='Submit emergency report'}};
+  }
+
+  if(centerOnly){
+    $('#sosButton').onclick=async()=>{try{let r=await api('/api/emergency/sos',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:$('#sosMessage').value,location_name:$('#sosLocation').value})});toast(r.message);refreshCurrent()}catch(x){toast(x.message)}};
+    $('#trustedForm').onsubmit=async e=>{e.preventDefault();try{await api('/api/trusted-contacts',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(Object.fromEntries(new FormData(e.target)))});toast('Trusted contact added.');refreshCurrent()}catch(x){toast(x.message)}};
+    if(admin)$('#contactForm').onsubmit=e=>{e.preventDefault();api('/api/emergency-contacts',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(Object.fromEntries(new FormData(e.target)))}).then(()=>{toast('Safety contact saved.');refreshCurrent()}).catch(x=>toast(x.message))};
+  }
 }function showPolicePortalShell(){
   document.querySelectorAll('aside .nav-link').forEach(item=>{
     if(item.dataset.page!=='police-portal')item.classList.add('d-none');
@@ -499,7 +624,7 @@ async function loadPoliceCases(el,page=1,silent=false){
     summary.innerHTML=[['Total cases',response.counts.total],['Pending',response.counts.pending],['In progress',response.counts.in_progress],['Resolved',response.counts.resolved]].map(([label,count])=>`<div class="police-stat"><small>${label}</small><strong>${count}</strong></div>`).join('');
     if(!response.items.length){container.innerHTML='<div class="empty">No emergency reports match these filters.</div>';return}
     const officers=[`<option value="">Unassigned</option>`,...response.officers.map(officer=>`<option value="${officer.user_id}">${escapeHtml(officer.name)} · ${escapeHtml(officer.police_id)}</option>`)];
-    const rows=response.items.map(item=>`<tr><td><strong>${escapeHtml(item.case_id)}</strong></td><td>${escapeHtml(item.category.replaceAll('_',' '))}</td><td><span class="badge-status">${escapeHtml(item.status.replaceAll('_',' '))}</span></td><td>${escapeHtml(item.reporter_name)}</td><td>${new Date(item.created_at).toLocaleString()}</td><td><details><summary>View details / update</summary><div class="police-case-details"><p><strong>Reporter:</strong> ${escapeHtml(item.reporter_name)} · ${escapeHtml(item.reporter_contact||'No contact provided')}</p><p><strong>Location:</strong> ${escapeHtml(item.location_name)}${item.latitude!==null?` (${escapeHtml(item.latitude)}, ${escapeHtml(item.longitude)})`:''}</p><p><strong>Description:</strong><br>${escapeHtml(item.description)}</p>${item.attachment?`<p><a href="${escapeHtml(item.attachment)}" target="_blank" rel="noopener">View supporting image</a></p>`:''}<form class="police-case-update" data-case-id="${escapeHtml(item.case_id)}"><label>Status<select name="status">${[['PENDING','Pending'],['IN_PROGRESS','In Progress'],['RESOLVED','Resolved']].map(([value,label])=>`<option value="${value}" ${item.status===value?'selected':''}>${label}</option>`).join('')}</select></label><label>Assigned officer<select name="assigned_officer_id">${officers.map(option=>option.replace(/value="([^"]+)"/,(_,value)=>`value="${value}" ${String(item.assigned_officer_id||'')===value?'selected':''}`)).join('')}</select></label><button class="btn btn-primary btn-sm" type="submit">Save case update</button></form></div></details></td></tr>`).join('');
+    const rows=response.items.map(item=>`<tr><td><strong>${escapeHtml(item.case_id)}</strong></td><td>${escapeHtml(item.category.replaceAll('_',' '))}</td><td><span class="badge-status">${escapeHtml(item.status.replaceAll('_',' '))}</span></td><td>${escapeHtml(item.reporter_name)}</td><td>${new Date(item.created_at).toLocaleString()}</td><td><details><summary>View details / update</summary><div class="police-case-details"><p><strong>Reporter:</strong> ${escapeHtml(item.reporter_name)} · ${escapeHtml(item.reporter_contact||'No contact provided')}</p><p><strong>Location:</strong> ${escapeHtml(item.location_name)}</p><p><strong>Description:</strong><br>${escapeHtml(item.description)}</p>${item.attachment?`<p><a href="${escapeHtml(item.attachment)}" target="_blank" rel="noopener">View supporting image</a></p>`:''}<form class="police-case-update" data-case-id="${escapeHtml(item.case_id)}"><label>Status<select name="status">${[['PENDING','Pending'],['IN_PROGRESS','In Progress'],['RESOLVED','Resolved']].map(([value,label])=>`<option value="${value}" ${item.status===value?'selected':''}>${label}</option>`).join('')}</select></label><label>Assigned officer<select name="assigned_officer_id">${officers.map(option=>option.replace(/value="([^"]+)"/,(_,value)=>`value="${value}" ${String(item.assigned_officer_id||'')===value?'selected':''}`)).join('')}</select></label><button class="btn btn-primary btn-sm" type="submit">Save case update</button></form></div></details></td></tr>`).join('');
     const pages=Array.from({length:response.pages},(_,index)=>index+1).map(number=>`<button class="btn btn-sm ${number===response.page?'btn-primary':'btn-outline-primary'}" data-case-page="${number}">${number}</button>`).join('');
     container.innerHTML=`<div class="table-responsive panel police-case-table"><table class="table align-middle"><thead><tr><th>Case ID</th><th>Category</th><th>Status</th><th>Reporter</th><th>Submitted</th><th>Details</th></tr></thead><tbody>${rows}</tbody></table><div class="police-pagination">${pages}</div></div>`;
     container.querySelectorAll('[data-case-page]').forEach(button=>button.onclick=()=>loadPoliceCases(el,Number(button.dataset.casePage)));
@@ -513,6 +638,6 @@ async function loadPoliceCases(el,page=1,silent=false){
   }catch(error){container.innerHTML=`<div class="alert alert-danger">${escapeHtml(error.message)}</div>`}
 }
 
-async function removeTrusted(id){try{await api('/api/trusted-contacts/'+id,{method:'DELETE'});go('emergency')}catch(e){toast(e.message)}}async function cancelSOS(id){try{await api('/api/emergency/sos/'+id+'/cancel',{method:'PUT'});toast('SOS cancelled.');go('emergency')}catch(e){toast(e.message)}}
+async function removeTrusted(id,returnPage='emergency'){try{await api('/api/trusted-contacts/'+id,{method:'DELETE'});go(returnPage)}catch(e){toast(e.message)}}async function cancelSOS(id,returnPage='emergency'){try{await api('/api/emergency/sos/'+id+'/cancel',{method:'PUT'});toast('SOS cancelled.');go(returnPage)}catch(e){toast(e.message)}}
 async function submitForm(e,url,done){e.preventDefault();let b=e.target.querySelector('button[type="submit"],button:last-child');let old=b.textContent;b.disabled=true;b.textContent='Processing…';try{let r=await api(url,{method:'POST',body:new FormData(e.target)});done(r)}catch(x){toast(x.message)}finally{b.disabled=false;b.textContent=old}}
 boot();
