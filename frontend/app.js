@@ -1,5 +1,5 @@
 let me=null, cases=[], policeRefreshTimer=null, phonePushSetup=null; const $=s=>document.querySelector(s);
-const api=async(url,opts={})=>{let r=await fetch(url,opts),d=await r.json().catch(()=>({}));if(!r.ok)throw Error(d.error||`Request failed (HTTP ${r.status}). Check that the server is running the latest app code.`);return d};
+const api=async(url,opts={})=>{let r=await fetch(url,opts),d=await r.json().catch(()=>({}));if(!r.ok){const staleWebcamApi=/\/api\/ai\/webcam\/references/.test(url)&&[404,405].includes(r.status);throw Error(staleWebcamApi?'The running server does not have the webcam registration API yet. Stop it and restart JanRaksha from this workspace, then refresh.':d.error||`Request failed (HTTP ${r.status}). Check that the server is running the latest app code.`)}return d};
 const toast=m=>{let t=$('#toast');t.textContent=m;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),3200)};
 const escapeHtml=value=>String(value??'').replace(/[&<>"']/g,character=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[character]));
 function decodeVapidKey(value){const padding='='.repeat((4-value.length%4)%4),base64=(value+padding).replace(/-/g,'+').replace(/_/g,'/'),raw=atob(base64);return Uint8Array.from(raw,char=>char.charCodeAt(0))}
@@ -20,8 +20,17 @@ async function webcamSearch(el){
     el.innerHTML = heading('Live webcam crowd detection', 'Sign in as a family member, citizen, investigator, or administrator to use your camera.') + '<div class="alert alert-warning">Your account does not currently have permission to access webcam matching.</div>';
     return;
   }
-  el.innerHTML = heading('AI Evidence Indicators', 'Use your camera to check for potential missing-person leads. Camera images are processed as possible matches, never as identity confirmation.') + `
-    <div class="alert-ai mb-3"><strong>Privacy and safety:</strong> Use this feature only with the knowledge and consent of people shown. Frames are processed to find potential missing-person leads; results require authorized human verification and are not proof of identity. Similarity is a relative image-descriptor score, not the probability that two images show the same person. Green indicates a possible lead; red indicates no relevant match in the current reference set; yellow indicates low image quality.</div>
+  el.innerHTML = heading('Live webcam', 'Register webcam-only reference photos and compare camera faces against that separate registry.') + `
+    <div class="alert-ai mb-3"><strong>Privacy:</strong> Webcam registrations and their photos are visible only to the account that registered them. They are used only by that account's live webcam and video scans.</div>
+    <div class="panel webcam-registry-panel">
+      <h3>Webcam-only registrations</h3>
+      <p class="text-muted">Upload one clear, front-facing photo. Use a photo you are authorized to register.</p>
+      <form id="webcamReferenceForm" class="webcam-reference-form">
+        <label>Clear face photo<input name="photo" type="file" accept="image/png,image/jpeg" required></label>
+        <button class="btn btn-outline-primary" type="submit">Register for webcam only</button>
+      </form>
+      <div id="webcamReferenceList" class="webcam-reference-list"><div class="empty">Loading webcam-only registrations…</div></div>
+    </div>
     <div class="panel webcam-shell">
       <div class="webcam-controls">
         <div class="d-flex gap-2 flex-wrap">
@@ -57,7 +66,7 @@ async function webcamSearch(el){
         <div><strong>Processing:</strong> <span id="processingStatus">Idle</span></div>
       </div>
       <div id="capturedFramePreview" class="captured-frame-preview d-none mt-3">
-        <strong>Captured frame and highest similarity result</strong>
+        <strong>Captured frame and per-face results</strong>
         <div class="captured-frame-layout">
           <div class="captured-frame-stage">
             <img alt="Captured webcam frame with face detection boxes" class="captured-frame-image">
@@ -70,6 +79,27 @@ async function webcamSearch(el){
     </div>
   `;
   const video=$('#webcamVideo'); const overlay=$('#faceOverlay'); const statusEl=$('#cameraStatus'); const facesEl=$('#facesDetected'); const processEl=$('#processingStatus'); const resultsEl=$('#webcamResults'); const previewEl=$('#capturedFramePreview'); const previewImage=previewEl.querySelector('img'); const previewOverlay=$('#capturedFrameOverlay'); const capturedMatchEl=$('#capturedFrameMatch'); const faceElements=new Map();
+  const referenceList=$('#webcamReferenceList');
+  async function refreshWebcamReferences(){
+    const data=await api('/api/ai/webcam/references');
+    referenceList.innerHTML=data.items.map(person=>`<article class="webcam-reference-row"><img src="${escapeHtml(person.photo)}" alt="Your registered webcam reference"><div><strong>${escapeHtml(person.reference_id)}</strong></div>${person.can_delete?`<button type="button" class="btn btn-sm btn-outline-danger" data-remove-webcam-reference="${person.id}">Remove</button>`:''}</article>`).join('')||'<div class="empty">No webcam-only registrations yet. Add a clear photo before scanning.</div>';
+  }
+  void refreshWebcamReferences().catch(error=>{referenceList.innerHTML=`<div class="alert alert-danger">${escapeHtml(error.message)}</div>`});
+  $('#webcamReferenceForm').onsubmit=async event=>{
+    event.preventDefault();
+    const form=event.currentTarget,button=form.querySelector('button[type="submit"]');
+    button.disabled=true;button.textContent='Registering…';
+    try{const response=await api('/api/ai/webcam/references',{method:'POST',body:new FormData(form)});form.reset();toast(response.message);await refreshWebcamReferences()}
+    catch(error){toast(error.message)}
+    finally{button.disabled=false;button.textContent='Register for webcam only'}
+  };
+  referenceList.addEventListener('click',async event=>{
+    const button=event.target.closest('[data-remove-webcam-reference]');
+    if(!button)return;
+    button.disabled=true;
+    try{const result=await api(`/api/ai/webcam/references/${button.dataset.removeWebcamReference}`,{method:'DELETE'});toast(result.message);await refreshWebcamReferences()}
+    catch(error){toast(error.message);button.disabled=false}
+  });
   let capturedFaces=[];
   function renderCapturedFaceBoxes(faces=[]){
     previewOverlay.replaceChildren();
@@ -77,14 +107,12 @@ async function webcamSearch(el){
     const overlayRect = previewOverlay.getBoundingClientRect();
     const scaleX = overlayRect.width / previewImage.naturalWidth;
     const scaleY = overlayRect.height / previewImage.naturalHeight;
-    const highestMatch = faces
-      .flatMap(face => (face.ranked_matches || []).map(match => ({face, score:Number(match.similarity_score) || 0})))
-      .sort((a, b) => b.score - a.score)[0];
     faces.forEach((face, index) => {
       const box = face.bbox || face;
       const faceBox = document.createElement('div');
-      const isHighestMatch = highestMatch && highestMatch.face.face_id === face.face_id;
-      const statusClass = isHighestMatch ? 'potential' : face.ranked_matches?.length ? 'neutral' : face.status === 'NO_RELEVANT_MATCH' ? 'no-match' : face.status === 'INSUFFICIENT_QUALITY' ? 'warning' : 'neutral';
+      const matchScore = Number(face.similarity_score);
+      const isMatch = face.status === 'POTENTIAL_MATCH' && Number.isFinite(matchScore) && matchScore >= 80;
+      const statusClass = isMatch ? 'potential' : face.status === 'NO_RELEVANT_MATCH' ? 'no-match' : face.status === 'INSUFFICIENT_QUALITY' ? 'warning' : 'neutral';
       faceBox.className = `face-box ${statusClass}`;
       faceBox.style.left = `${box.x * scaleX}px`;
       faceBox.style.top = `${box.y * scaleY}px`;
@@ -127,7 +155,7 @@ async function webcamSearch(el){
       note.textContent=`Highest similarity in the sampled frames at ${response.best_match.timestamp_seconds}s. Human verification is required; similarity is not proof of identity.`;
       result.appendChild(note);
       const matchContainer=document.createElement('div');
-      matchContainer.innerHTML=renderMatchGrid([response.best_match], false, null, true);
+      matchContainer.innerHTML=renderWebcamReferenceMatch(response.best_match);
       result.appendChild(matchContainer);
       const verifyButton=matchContainer.querySelector('[data-webcam-verify]');
       if (verifyButton) verifyButton.addEventListener('click', async ()=>{
@@ -167,9 +195,6 @@ async function webcamSearch(el){
   }
   function renderFaceBoxes(faces=[]){
     const activeFaceIds = new Set();
-    const highestMatch = faces
-      .flatMap(face => (face.ranked_matches || []).map(match => ({face, score:Number(match.similarity_score) || 0})))
-      .sort((a, b) => b.score - a.score)[0];
     const videoRect = video.getBoundingClientRect();
     const overlayRect = overlay.getBoundingClientRect();
     const sourceWidth = video.videoWidth || 640;
@@ -191,8 +216,12 @@ async function webcamSearch(el){
       const x = videoRect.left - overlayRect.left + offsetX + box.x * scale;
       const y = videoRect.top - overlayRect.top + offsetY + box.y * scale;
       const w = box.width * scale, h = box.height * scale;
-      const isHighestMatch = highestMatch && highestMatch.face.face_id === faceId;
-      const statusClass = isHighestMatch ? 'potential' : result.ranked_matches?.length ? 'neutral' : result.status === 'POTENTIAL_MATCH' ? 'potential' : result.status === 'NO_RELEVANT_MATCH' ? 'no-match' : result.status === 'INSUFFICIENT_QUALITY' ? 'warning' : 'neutral';
+      // A ranked reference can be a low-confidence lead. Only the backend's
+      // explicit potential-match decision is allowed to use green styling.
+      const score = Number(result.similarity_score);
+      // Backend status already reflects the SFace cosine threshold.
+      const isMatch = result.status === 'POTENTIAL_MATCH' && Number.isFinite(score) && score >= 80;
+      const statusClass = isMatch ? 'potential' : result.status === 'NO_RELEVANT_MATCH' ? 'no-match' : result.status === 'INSUFFICIENT_QUALITY' ? 'warning' : 'neutral';
       faceBox.className = `face-box ${statusClass}`;
       faceBox.style.left = x + 'px'; faceBox.style.top = y + 'px'; faceBox.style.width = w + 'px'; faceBox.style.height = h + 'px';
       const label = document.createElement('div');
@@ -200,13 +229,13 @@ async function webcamSearch(el){
       const faceLabel = faceId.startsWith('face_')
         ? 'Face ' + faceId.slice(5)
         : 'Face ' + String(index + 1).padStart(2, '0');
-      const hasSimilarity = result.similarity_score !== null && result.similarity_score !== undefined
-        && Number.isFinite(Number(result.similarity_score));
+      const hasSimilarity = isMatch && Number.isFinite(score);
+      const personName = result.matched_person?.name;
       label.textContent = hasSimilarity
-        ? `${faceLabel} · ${Number(result.similarity_score).toFixed(1)}%`
+        ? `${faceLabel}${personName ? ` · ${personName}` : ''} · ${score.toFixed(1)}%`
         : faceLabel;
-      if (result.case_id && hasSimilarity) {
-        faceBox.title = `Closest reference ${result.case_id}; relative similarity, not a confirmed identity match.`;
+      if (result.reference_id && hasSimilarity) {
+        faceBox.title = `Webcam-only reference ${result.reference_id}; relative similarity, not a confirmed identity match.`;
       } else {
         faceBox.removeAttribute('title');
       }
@@ -241,13 +270,6 @@ async function webcamSearch(el){
     const candidates = document.createElement('div');
     candidates.className = 'webcam-candidates';
     const hasRankedLeads = items.some(item => item.ranked_matches?.length);
-    if (hasRankedLeads) {
-      const highest = items
-        .flatMap(item => (item.ranked_matches || []).map(match => ({item, match})))
-        .sort((a, b) => Number(b.match.similarity_score || 0) - Number(a.match.similarity_score || 0))[0];
-      // Keep just one face and one case card: the highest score in this frame.
-      items = [{...highest.item, ranked_matches: [highest.match]}];
-    }
     items.forEach((item, index) => {
       const result = document.createElement('div');
       result.className = `result webcam-result${item.status === 'POTENTIAL_MATCH' ? ' webcam-result-potential' : ''}`;
@@ -257,12 +279,10 @@ async function webcamSearch(el){
         )[0];
         const reviewNote = document.createElement('p');
         reviewNote.className = 'webcam-review-note';
-        reviewNote.textContent = item.status === 'POTENTIAL_MATCH'
-          ? 'Showing the highest similarity result. Human verification is required; similarity is not proof of identity.'
-          : 'Showing the highest similarity result for human review. This low-confidence similarity is not a confirmed match.';
+        reviewNote.textContent = `Face ${String(item.index || index + 1).padStart(2, '0')}: webcam-only reference lead. Human review is required; similarity is not proof of identity.`;
         result.appendChild(reviewNote);
         const rankedCards = document.createElement('div');
-        rankedCards.innerHTML = renderMatchGrid([topMatch], false, null, true);
+        rankedCards.innerHTML = renderWebcamReferenceMatch(topMatch);
         result.appendChild(rankedCards);
         rankedCards.querySelectorAll('[data-webcam-verify]').forEach(verifyButton => {
           verifyButton.addEventListener('click', async () => {
@@ -324,24 +344,6 @@ async function webcamSearch(el){
     });
     return chart;
   }
-  async function addFallbackWebcamMatches(faces=[]){
-    await Promise.all(faces.map(async face=>{
-      if (face.ranked_matches?.length || !face.case_id || !Number.isFinite(Number(face.similarity_score))) return;
-      try {
-        const response = await api('/api/missing-persons?q=' + encodeURIComponent(face.case_id));
-        const person = (response.items || []).find(entry => entry.case_id === face.case_id);
-        if (person) face.ranked_matches = [{
-          case: person,
-          similarity_score: Number(face.similarity_score),
-          status: face.status === 'POTENTIAL_MATCH' ? 'REQUIRES_HUMAN_VERIFICATION' : 'LOW_CONFIDENCE_LEAD',
-          match_id: face.match_id || null,
-        }];
-      } catch (error) {
-        console.warn('Could not load the reference photo for a webcam similarity result.', error);
-      }
-    }));
-    return faces;
-  }
   function removeClosedWebcamMatches(faces=[]){
     const isClosed = status => String(status || '').toUpperCase().replaceAll(' ', '_') === 'CLOSED';
     return faces.map(face=>{
@@ -383,7 +385,7 @@ async function webcamSearch(el){
       const form = new FormData(); form.append('frame', blob, 'webcam-frame.jpg'); form.append('session_id', webcamState.sessionId);
       const data = await api('/api/ai/webcam/process-frame', {method:'POST', body:form});
       if (!webcamState.active) return;
-      const faces = removeClosedWebcamMatches(await addFallbackWebcamMatches(data.faces || []));
+      const faces = removeClosedWebcamMatches(data.faces || []);
       renderFaceBoxes(faces);
       if (manual) {
         capturedFaces = faces;
@@ -392,10 +394,9 @@ async function webcamSearch(el){
       facesEl.textContent = String(data.faces_detected || 0);
       renderDetectionStatus(faces);
       if (manual) {
-        const hasMatch = faces.some(face => face.ranked_matches?.length);
-        const visibleMatch = hasMatch ? resultsEl.querySelector('.webcam-result') : null;
-        if (visibleMatch) {
-          capturedMatchEl.replaceChildren(visibleMatch);
+        const visibleMatches = [...resultsEl.querySelectorAll('.webcam-result')];
+        if (visibleMatches.length) {
+          capturedMatchEl.replaceChildren(...visibleMatches);
         } else {
           capturedMatchEl.textContent = faces.length
             ? 'No similar registered person was found for this captured frame.'
@@ -688,7 +689,13 @@ async function openInvestigatorMatch(matchId){
 
 function personFields(){return `<label>Full name<input name="name" required></label><div class="row"><div class="col"><label>Age<input name="age" type="number" min="0"></label></div><div class="col"><label>Gender<select name="gender"><option>Not specified</option><option>Female</option><option>Male</option><option>Other</option></select></label></div></div><label>Photograph<div class="drop"><i class="fa-solid fa-cloud-arrow-up"></i> JPG or PNG, max 5 MB<input name="photo" type="file" accept="image/png,image/jpeg" required></div></label>`}
 function caseForm(el){if(!['FAMILY_USER','INVESTIGATOR','ADMIN_DEMO','POLICE_OFFICER'].includes(me.role)){el.innerHTML=heading('Register missing person')+'<div class="alert alert-warning">Your role cannot register cases.</div>';return}el.innerHTML=heading('Register missing person','Create a secure case. The system will create the case ID and embedding.')+`<form id="caseForm" class="panel form-panel">${personFields()}<label>Last-seen location<input name="last_seen_location" required></label><div class="row"><div class="col"><label>Date<input name="last_seen_date" type="date"></label></div><div class="col"><label>Time<input name="last_seen_time" type="time"></label></div></div><label>Description<textarea name="description"></textarea></label><label>Clothing description<textarea name="clothing_description"></textarea></label><button class="btn btn-primary">Create case and process photo</button></form>`;$('#caseForm').onsubmit=e=>submitForm(e,'/api/missing-persons',r=>{toast(r.message);viewCase(r.person.id)})}
-function renderMatchGrid(matches, isFound=false, reportId=null, isWebcam=false){if(!matches.length){return '<div class="empty">No potential matches found.</div>'}const ranked=matches.map(match=>({item:match.case||match.person||match,score:Number(match.similarity_score)||0,matchId:match.match_id})).sort((a,b)=>b.score-a.score);return `<div class="match-comparison">${ranked.map(({item,score,matchId},index)=>{const percent=Math.min(100,Math.max(0,score));const label=Number.isInteger(score)?score:score.toFixed(1);const action=isFound?`<div class="match-actions"><input id="verifyLocation-${item.case_id}" class="mb-2" placeholder="Verified location" value="${document.querySelector('#foundForm input[name=\'location_name\']')?.value||''}"><div class="d-flex gap-2"><button class="btn btn-sm btn-primary" onclick="verifyFoundReport(${reportId}, '${item.case_id}', true)">Yes, verified</button><button class="btn btn-sm btn-outline-secondary" onclick="verifyFoundReport(${reportId}, '${item.case_id}', false)">No, not this person</button></div></div>`:isWebcam?(['INVESTIGATOR','ADMIN_DEMO','FAMILY_USER','CITIZEN','POLICE_OFFICER'].includes(me.role)?`<button type="button" class="btn btn-sm btn-outline-primary" data-webcam-verify data-case-id="${item.case_id}">Verify this match</button>`:'<span class="webcam-review-note">Requires authorized human review</span>'):`<button class="btn btn-link btn-sm p-0" onclick="viewCase(${item.id})">View case</button>`;const caseDetails=isWebcam?`${item.age??'—'} yrs · ${item.last_seen_location||'Location not shared'}`:`${item.case_id||''} · ${item.age??'—'} yrs · ${item.last_seen_location||'Location not shared'}`;const badge=isWebcam&&matchId?'HUMAN VERIFICATION REQUIRED':isWebcam&&item.status==='LOW_CONFIDENCE_LEAD'?'LOW CONFIDENCE · HUMAN REVIEW REQUIRED':item.status||'POTENTIAL MATCH';return `<article class="match-row"><div class="match-rank" aria-label="Rank ${index+1}">${index+1}</div><img class="match-photo" src="${item.photo||''}" alt="Photo for ${item.name||'potential match'}"><div class="match-details"><div class="match-heading"><div><h5>${item.name||'Unknown person'}</h5><small>${caseDetails}</small></div><strong class="score-pill">${label}%</strong></div><div class="score-panel"><div class="score-labels"><span>Similarity score</span><strong>${label}%</strong></div><div class="score-bar" role="meter" aria-label="Similarity score" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${percent}"><span class="score-fill" style="width:${percent}%"></span></div></div><div class="match-footer"><span class="badge-status">${badge}</span>${action}</div></div></article>`}).join('')}</div>`;}
+function renderMatchGrid(matches, isFound=false, reportId=null, isWebcam=false){if(!matches.length){return '<div class="empty">No potential matches found.</div>'}const ranked=matches.map(match=>({item:match.case||match.person||match,score:Number(match.similarity_score)||0,matchId:match.match_id})).sort((a,b)=>b.score-a.score);return `<div class="match-comparison">${ranked.map(({item,score,matchId},index)=>{const percent=Math.min(100,Math.max(0,score));const label=Number.isInteger(score)?score:score.toFixed(1);const action=isFound?`<div class="match-actions"><input id="verifyLocation-${item.case_id}" class="mb-2" placeholder="Verified location" value="${document.querySelector('#foundForm input[name=\'location_name\']')?.value||''}"><div class="d-flex gap-2"><button class="btn btn-sm btn-primary" onclick="verifyFoundReport(${reportId}, '${item.case_id}', true)">Yes, verified</button><button class="btn btn-sm btn-outline-secondary" onclick="verifyFoundReport(${reportId}, '${item.case_id}', false)">No, not this person</button></div></div>`:isWebcam?'<span class="webcam-review-note">Webcam-only reference · human review required</span>':`<button class="btn btn-link btn-sm p-0" onclick="viewCase(${item.id})">View case</button>`;const caseDetails=isWebcam?`${item.reference_id||item.case_id||''} · ${item.age??'—'} yrs${item.description?` · ${item.description}`:''}`:`${item.case_id||''} · ${item.age??'—'} yrs · ${item.last_seen_location||'Location not shared'}`;const badge=isWebcam?'WEBCAM ONLY · REVIEW REQUIRED':item.status||'POTENTIAL MATCH';return `<article class="match-row"><div class="match-rank" aria-label="Rank ${index+1}">${index+1}</div><img class="match-photo" src="${item.photo||''}" alt="Photo for ${item.name||'potential match'}"><div class="match-details"><div class="match-heading"><div><h5>${item.name||'Unknown person'}</h5><small>${caseDetails}</small></div><strong class="score-pill">${label}%</strong></div><div class="score-panel"><div class="score-labels"><span>Similarity score</span><strong>${label}%</strong></div><div class="score-bar" role="meter" aria-label="Similarity score" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${percent}"><span class="score-fill" style="width:${percent}%"></span></div></div><div class="match-footer"><span class="badge-status">${badge}</span>${action}</div></div></article>`}).join('')}</div>`;}
+function renderWebcamReferenceMatch(match){
+  const person=match.case||match.person||{};
+  const score=Math.min(100,Math.max(0,Number(match.similarity_score)||0));
+  const details=[person.reference_id||person.case_id,person.age===null||person.age===undefined?'':`${person.age} years`,person.description||''].filter(Boolean).join(' · ');
+  return `<div class="match-comparison"><article class="match-row"><div class="match-rank" aria-label="Webcam reference">•</div><img class="match-photo" src="${escapeHtml(person.photo||'')}" alt="Registered webcam reference"><div class="match-details"><div class="match-heading"><div><h5>${escapeHtml(person.name||'Registered person')}</h5><small>${escapeHtml(details)}</small></div><strong class="score-pill">${score.toFixed(1)}%</strong></div><div class="score-panel"><div class="score-labels"><span>Relative similarity</span><strong>${score.toFixed(1)}%</strong></div><div class="score-bar" role="meter" aria-label="Relative similarity" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${score}"><span class="score-fill" style="width:${score}%"></span></div></div><div class="match-footer"><span class="badge-status">WEBCAM ONLY · MANUAL IDENTITY CHECK</span></div></div></article></div>`;
+}
 function search(el){el.innerHTML=heading('AI photo search','Upload a photo to search authorized missing-person embeddings.')+`<div class="alert-ai">AI-generated results are potential leads and require human verification. A similarity score is not an identity decision.</div><form id="searchForm" class="panel form-panel"><label>Query photograph<input name="photo" type="file" accept="image/png,image/jpeg" required></label><label>Exclude existing case ID (optional)<input name="exclude_case_id" placeholder="JR-2026-0001"></label><button class="btn btn-primary">Process and search</button></form><div id="results"></div>`;$('#searchForm').onsubmit=e=>submitForm(e,'/api/ai/search',r=>{$('#results').innerHTML=`<div class="panel"><h4>Ranked potential matches</h4><p class="small text-muted">Sorted by AI similarity score. Results are leads, not identity confirmation.</p>${r.chart?`<img class="match-chart" src="${r.chart}" alt="Seaborn chart comparing similarity scores by case">`:''}${renderMatchGrid(r.matches, false)}</div>`})}
 function sightingForm(el){el.innerHTML=heading('Report a sighting','Submit a lead for authorized review. Location details are access controlled.')+`<form id="sightingForm" class="panel form-panel"><label>Related case ID<input name="case_id" placeholder="JR-2026-0001" required></label><label>Photo (optional)<input name="photo" type="file" accept="image/png,image/jpeg"></label><label>Description<textarea name="description" required></textarea></label><label>Location name<input name="location_name" required></label><button class="btn btn-primary">Submit sighting</button></form>`;$('#sightingForm').onsubmit=e=>submitForm(e,'/api/sightings',r=>toast(r.message))}
 function foundForm(el){el.innerHTML=heading('Report found person','This creates an AI-assisted lead only. Citizens cannot mark a case as found without human verification.')+`<form id="foundForm" class="panel form-panel"><label>Photograph<input name="photo" type="file" accept="image/png,image/jpeg" required></label><label>Exclude existing case ID (optional)<input name="exclude_case_id" placeholder="JR-2026-0001"></label><label>Description<textarea name="description"></textarea></label><label>Current location<input name="location_name" required></label><button class="btn btn-primary">Submit and find potential matches</button></form><div id="foundResults"></div>`;$('#foundForm').onsubmit=e=>submitForm(e,'/api/found-persons',r=>{$('#foundResults').innerHTML=`<div class="panel"><h4>Ranked potential matches</h4><p class="small text-muted">A human must confirm the match before any email alert is sent.</p>${r.chart?`<img class="match-chart" src="${r.chart}" alt="Seaborn chart comparing similarity scores by case">`:''}${renderMatchGrid(r.matches, true, r.report_id)}</div>`;toast(r.message)})}

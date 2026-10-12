@@ -105,6 +105,23 @@ class FaceEmbedding(db.Model):
     embedding_vector = db.Column(db.Text, nullable=False); model_name = db.Column(db.String(80)); embedding_dimension = db.Column(db.Integer); created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
 
+class WebcamPerson(db.Model):
+    __tablename__ = 'webcam_people'
+    id = db.Column(db.Integer, primary_key=True)
+    reference_id = db.Column(db.String(24), nullable=False, unique=True, index=True)
+    registered_by = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False, index=True)
+    name = db.Column(db.String(120), nullable=False)
+    age = db.Column(db.Integer)
+    gender = db.Column(db.String(30))
+    photo = db.Column(db.String(255), nullable=False)
+    description = db.Column(db.Text)
+    status = db.Column(db.String(20), nullable=False, default='ACTIVE', index=True)
+    embedding_vector = db.Column(db.Text, nullable=False)
+    embedding_dimension = db.Column(db.Integer, nullable=False)
+    model_name = db.Column(db.String(80), nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+
+
 class Sighting(db.Model):
     id = db.Column(db.Integer, primary_key=True); case_id = db.Column(db.String(20)); reported_by = db.Column(db.Integer, db.ForeignKey('user.id'))
     photo = db.Column(db.String(255)); description = db.Column(db.Text); location_name = db.Column(db.String(200))
@@ -301,9 +318,31 @@ def person_json(p):
             'last_seen_time': p.last_seen_time, 'status': p.status, 'created_at': p.created_at.isoformat()}
 
 
+def webcam_person_json(person):
+    return {
+        'id': person.id,
+        'reference_id': person.reference_id,
+        'name': person.name,
+        'age': person.age,
+        'gender': person.gender,
+        'photo': person.photo,
+        'description': person.description,
+        'status': person.status,
+        'created_at': person.created_at.isoformat(),
+    }
+
+
 def next_case_id():
     yr = datetime.utcnow().year; prefix = f'JR-{yr}-'; last = MissingPerson.query.filter(MissingPerson.case_id.like(prefix + '%')).order_by(MissingPerson.case_id.desc()).first()
     n = int(last.case_id[-4:]) + 1 if last else 1; return f'{prefix}{n:04d}'
+
+
+def next_webcam_reference_id():
+    year = datetime.utcnow().year
+    prefix = f'WCR-{year}-'
+    last = WebcamPerson.query.filter(WebcamPerson.reference_id.like(prefix + '%')).order_by(WebcamPerson.reference_id.desc()).first()
+    sequence = int(last.reference_id[-5:]) + 1 if last else 1
+    return f'{prefix}{sequence:05d}'
 
 
 def save_file(file):
@@ -367,10 +406,86 @@ def _safe_haar_cascade(model_name):
     return None
 
 
+WEBCAM_FACE_MODEL = 'opencv-sface-yunet-v1'
+# Use a conservative webcam threshold. OpenCV's 0.363 is a generic benchmark
+# cutoff; it allowed visibly incorrect webcam leads in this application's
+# camera/reference conditions. This threshold maps to an 80% display score.
+WEBCAM_FACE_COSINE_THRESHOLD = 0.60
+_webcam_face_models = None
+_webcam_face_models_lock = Lock()
+
+
+def _get_webcam_face_models():
+    """Load the official OpenCV Zoo YuNet detector and SFace recognizer once."""
+    global _webcam_face_models
+    if _webcam_face_models is not None:
+        return _webcam_face_models
+    with _webcam_face_models_lock:
+        if _webcam_face_models is not None:
+            return _webcam_face_models
+        model_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'models')
+        detector_path = os.path.join(model_dir, 'face_detection_yunet_2023mar.onnx')
+        recognizer_path = os.path.join(model_dir, 'face_recognition_sface_2021dec.onnx')
+        if not os.path.isfile(detector_path) or not os.path.isfile(recognizer_path):
+            raise ValueError('Webcam face recognition models are missing. Restore the models folder and restart JanRaksha.')
+        if not hasattr(cv2, 'FaceDetectorYN') or not hasattr(cv2, 'FaceRecognizerSF'):
+            raise ValueError('Webcam face recognition needs OpenCV 4.10 or newer. Install requirements.txt and restart JanRaksha.')
+        try:
+            detector = cv2.FaceDetectorYN.create(detector_path, '', (320, 320), 0.8, 0.3, 5000)
+            recognizer = cv2.FaceRecognizerSF.create(recognizer_path, '')
+        except cv2.error as error:
+            raise ValueError(f'Could not load the webcam face recognition models: {error}') from error
+        _webcam_face_models = (detector, recognizer)
+        return _webcam_face_models
+
+
+def _detect_webcam_faces(image):
+    detector, _ = _get_webcam_face_models()
+    try:
+        detector.setInputSize((image.shape[1], image.shape[0]))
+        _, rows = detector.detect(image)
+    except cv2.error as error:
+        raise ValueError(f'Could not detect faces in this image: {error}') from error
+    if rows is None:
+        return []
+    results = []
+    for row in rows:
+        x, y, width, height = [int(round(value)) for value in row[:4]]
+        if width < 20 or height < 20:
+            continue
+        results.append({
+            'x': max(0, x), 'y': max(0, y), 'width': width, 'height': height,
+            # FaceRecognizerSF.alignCrop expects YuNet's complete 15-value
+            # row (box, five landmarks, and detector confidence).
+            'landmarks': row.astype(np.float32),
+            'detector_confidence': float(row[14]),
+        })
+    return results
+
+
+def _webcam_face_embedding(image, face):
+    landmarks = face.get('landmarks') if isinstance(face, dict) else None
+    if landmarks is None:
+        raise ValueError('Face landmarks are missing. Capture the registration photo again.')
+    _, recognizer = _get_webcam_face_models()
+    try:
+        aligned = recognizer.alignCrop(image, np.asarray(landmarks, dtype=np.float32))
+        feature = recognizer.feature(aligned).reshape(-1).astype(np.float32)
+    except cv2.error as error:
+        raise ValueError('Could not align this face. Use a clear, front-facing photo.') from error
+    norm = float(np.linalg.norm(feature))
+    if feature.size != 128 or norm <= 1e-8:
+        raise ValueError('The face recognition model returned an invalid feature vector.')
+    return feature / norm
+
+
 def detect_multiple_faces(frame_path):
     image = cv2.imread(frame_path)
     if image is None:
         raise ValueError('The webcam frame could not be read.')
+    # YuNet provides the facial landmarks required to align faces consistently
+    # for SFace embeddings at both registration and live matching time.
+    return _detect_webcam_faces(image)
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     gray = cv2.equalizeHist(gray)
     frontal_cascade = _safe_haar_cascade('haarcascade_frontalface_default.xml')
@@ -385,11 +500,13 @@ def detect_multiple_faces(frame_path):
     # Run two frontal Haar models: the alternate model often finds faces at
     # slightly different lighting/expressions. Profile models below cover
     # side views. The overlap pass merges duplicate boxes from these models.
+    minimum_face_size = max(64, int(min(gray.shape[:2]) * 0.12))
     for cascade in (frontal_cascade, frontal_alt_cascade):
         if cascade is None:
             continue
         frontal = cascade.detectMultiScale(
-            gray, scaleFactor=1.08, minNeighbors=5, minSize=(40, 40)
+            gray, scaleFactor=1.1, minNeighbors=7,
+            minSize=(minimum_face_size, minimum_face_size),
         )
         detected.extend((int(x), int(y), int(w), int(h)) for x, y, w, h in frontal)
 
@@ -399,7 +516,8 @@ def detect_multiple_faces(frame_path):
     if profile_cascade is not None:
         for profile_gray, mirrored in ((gray, False), (cv2.flip(gray, 1), True)):
             profiles = profile_cascade.detectMultiScale(
-                profile_gray, scaleFactor=1.1, minNeighbors=4, minSize=(32, 32)
+                profile_gray, scaleFactor=1.1, minNeighbors=6,
+                minSize=(minimum_face_size, minimum_face_size),
             )
             for x, y, width, height in profiles:
                 x, y, width, height = int(x), int(y), int(width), int(height)
@@ -631,9 +749,9 @@ def invalidate_webcam_case_cache(case_id):
         for state in webcam_tracks.values():
             for track in state.get('faces', {}).values():
                 cached = track.get('result') or {}
-                candidate_ids = {cached.get('case_id')}
+                candidate_ids = {cached.get('case_id'), cached.get('reference_id')}
                 candidate_ids.update(
-                    (match.get('case') or {}).get('case_id')
+                    (match.get('case') or {}).get('reference_id')
                     for match in cached.get('ranked_matches', [])
                 )
                 if case_id in candidate_ids:
@@ -713,8 +831,58 @@ def embedding_from_file(path):
     return generate_embedding(_expanded_face_crop(image, faces[0]))
 
 
+def webcam_embedding_from_file(path):
+    image = cv2.imread(path)
+    if image is None:
+        raise ValueError('The uploaded image could not be read.')
+    faces = _detect_webcam_faces(image)
+    if not faces:
+        raise ValueError('No face was detected. Use a clear, front-facing portrait.')
+    if len(faces) > 1:
+        raise ValueError('More than one face was detected. Register a photo that shows only this person.')
+    face = faces[0]
+    crop = _expanded_face_crop(image, face)
+    quality = _face_quality_metrics(crop)
+    if not quality['ok']:
+        raise ValueError(quality['reason'] + ' Use a clear, front-facing portrait.')
+    return _webcam_face_embedding(image, face)
+
+
 def search_embedding(vector, source_type=None, source_id=None):
     return search_missing_persons(vector, source_type=source_type, source_id=source_id)
+
+
+def search_webcam_people(vector, user_id):
+    query = np.asarray(vector, dtype=np.float32)
+    matches = []
+    if user_id is None:
+        return matches
+    for person in WebcamPerson.query.filter_by(status='ACTIVE', registered_by=user_id).all():
+        try:
+            reference = np.asarray(json.loads(person.embedding_vector), dtype=np.float32)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            app.logger.warning('Skipping invalid webcam reference embedding %s.', person.reference_id)
+            continue
+        if reference.size != query.size or person.model_name != WEBCAM_FACE_MODEL:
+            photo_path = os.path.join(app.config['UPLOAD_FOLDER'], os.path.basename(person.photo or ''))
+            if not person.photo or not os.path.isfile(photo_path):
+                continue
+            try:
+                reference = webcam_embedding_from_file(photo_path)
+            except ValueError as error:
+                app.logger.warning('Could not refresh webcam reference %s: %s', person.reference_id, error)
+                continue
+            person.embedding_vector = json.dumps(reference.tolist())
+            person.embedding_dimension = int(reference.size)
+            person.model_name = WEBCAM_FACE_MODEL
+            db.session.flush()
+        if reference.size != query.size:
+            continue
+        cosine = float(np.clip(np.dot(query, reference), -1, 1))
+        similarity = min(99.9, round((cosine + 1) * 50, 1))
+        matches.append({'person': person, 'similarity': similarity, 'cosine': cosine})
+    matches.sort(key=lambda match: match['similarity'], reverse=True)
+    return matches
 
 
 def match_chart_data(matches):
@@ -842,6 +1010,11 @@ def investigator_match_page(match_id):
 def uploads(name):
     if name.replace('\\', '/').lstrip('/').startswith('emergency-cases/'):
         return api_error('Resource not found.', 404)
+    webcam_reference = WebcamPerson.query.filter_by(photo=f'/uploads/{name}').first()
+    if webcam_reference:
+        user = current_user()
+        if not user or webcam_reference.registered_by != user.id:
+            return api_error('Resource not found.', 404)
     return send_from_directory(app.config['UPLOAD_FOLDER'], name)
 
 
@@ -1007,13 +1180,7 @@ def webcam_search_page():
 
 def can_access_webcam_session(session_record):
     user = current_user()
-    return bool(
-        user
-        and (
-            user.role in {'INVESTIGATOR', 'ADMIN_DEMO'}
-            or session_record.investigator_id == user.id
-        )
-    )
+    return bool(user and session_record.investigator_id == user.id)
 
 
 def can_review_match(match):
@@ -1080,9 +1247,9 @@ def webcam_process_frame():
         for index, (face, (face_id, cached_result)) in enumerate(zip(faces, assignments), start=1):
             raw_crop = None
             bbox = {'x': face['x'], 'y': face['y'], 'width': face['width'], 'height': face['height']}
-            if cached_result and cached_result.get('case_id'):
-                cached_person = MissingPerson.query.filter_by(case_id=cached_result['case_id']).first()
-                if not cached_person or normalize_case_status(cached_person.status) == 'CLOSED':
+            if cached_result and cached_result.get('reference_id'):
+                cached_person = WebcamPerson.query.filter_by(reference_id=cached_result['reference_id']).first()
+                if not cached_person or cached_person.status != 'ACTIVE':
                     cached_result = None
             if cached_result is not None:
                 face_results.append({**cached_result, 'bbox': bbox, 'index': index, 'label': 'Face ' + str(index)})
@@ -1097,7 +1264,7 @@ def webcam_process_frame():
             status = 'NO_RELEVANT_MATCH'
             evidence_message = 'AI Evidence Indicator: no relevant match in the current reference set.'
             similarity_score = None
-            case_id = None
+            reference_id = None
             matched_person = None
             match_id = None
             ranked_candidates = []
@@ -1108,58 +1275,29 @@ def webcam_process_frame():
                     status = 'INSUFFICIENT_QUALITY'
                     evidence_message = quality['reason']
                 else:
-                    embedding = generate_embedding(raw_crop)
-                    matches = search_missing_persons(
-                        embedding,
-                        source_type='WEBCAM',
-                        source_id=session_record.id,
-                        record_matches=False,
-                        similarity_threshold=0.0,
-                        include_low_confidence=True,
-                    )
+                    embedding = _webcam_face_embedding(image, face)
+                    matches = search_webcam_people(embedding, current_user().id)
                     if matches:
                         best = max(matches, key=lambda candidate: candidate['similarity'])
-                        similarity_score = float(best['similarity'])
-                        matched_person = best['person']
-                        case_id = matched_person.case_id
-                        status = 'POTENTIAL_MATCH' if best.get('combined_score', 0.0) >= 80 else 'NO_RELEVANT_MATCH'
-                        match_chart = match_chart_data(matches)
-                        # A webcam frame should expose only its highest-scoring case.
-                        # Lower-ranked registered people add noise and are not useful
-                        # for the live review flow.
-                        for candidate in (best,):
-                            person = candidate['person']
-                            candidate_match = None
-                            if normalize_case_status(person.status) != 'PERSON_FOUND':
-                                # One review item per case per webcam session; frame polling must not
-                                # create a new investigator task every few seconds.
-                                candidate_match = AIMatch.query.filter_by(
-                                    source_type='WEBCAM', source_id=session_record.id,
-                                    missing_person_id=person.id,
-                                ).order_by(AIMatch.created_at.desc()).first()
-                                if not candidate_match:
-                                    candidate_match = AIMatch(
-                                        source_type='WEBCAM', source_id=session_record.id,
-                                        missing_person_id=person.id,
-                                        similarity_score=candidate['similarity'],
-                                        combined_score=candidate['combined_score'],
-                                        status='REQUIRES_HUMAN_VERIFICATION',
-                                    )
-                                    db.session.add(candidate_match)
-                                    db.session.flush()
-                            ranked_candidates.append({
-                                'case': person_json(person),
-                                'similarity_score': candidate['similarity'],
-                                'status': normalize_match_status(candidate_match.status) if candidate_match else 'LOW_CONFIDENCE_LEAD',
-                                'match_id': candidate_match.id if candidate_match and normalize_match_status(candidate_match.status) == 'REQUIRES_HUMAN_VERIFICATION' else None,
-                            })
-                        if status == 'POTENTIAL_MATCH' and ranked_candidates:
-                            match_id = ranked_candidates[0]['match_id']
-                        evidence_message = 'AI Evidence Indicator: plausible relevant match requiring human review.' if status == 'POTENTIAL_MATCH' else 'AI Evidence Indicator: no relevant match in the current reference set.'
+                        status = 'POTENTIAL_MATCH' if best['cosine'] >= WEBCAM_FACE_COSINE_THRESHOLD else 'NO_RELEVANT_MATCH'
+                        if status == 'POTENTIAL_MATCH':
+                            matched_person = best['person']
+                            similarity_score = float(best['similarity'])
+                            reference_id = matched_person.reference_id
+                            ranked_candidates = [{
+                                'case': {
+                                    **webcam_person_json(matched_person),
+                                    'case_id': matched_person.reference_id,
+                                },
+                                'similarity_score': best['similarity'],
+                                'status': 'WEBCAM_ONLY_REFERENCE',
+                                'match_id': None,
+                            }]
+                        evidence_message = 'AI Evidence Indicator: webcam-only reference lead requires human review.' if status == 'POTENTIAL_MATCH' else 'AI Evidence Indicator: no relevant match in the webcam-only reference set.'
                     else:
-                        evidence_message = 'AI Evidence Indicator: no relevant match in the current reference set.'
-            if status == 'POTENTIAL_MATCH' and case_id:
-                db.session.add(WebcamDetection(session_id=session_record.session_id, case_id=case_id, similarity_score=similarity_score, frame_timestamp=datetime.utcnow().isoformat(), status=status))
+                        evidence_message = 'AI Evidence Indicator: no relevant match in the webcam-only reference set.'
+            if status == 'POTENTIAL_MATCH' and reference_id:
+                db.session.add(WebcamDetection(session_id=session_record.session_id, case_id=reference_id, similarity_score=similarity_score, frame_timestamp=datetime.utcnow().isoformat(), status=status))
             elif status in {'NO_RELEVANT_MATCH', 'INSUFFICIENT_QUALITY'}:
                 db.session.add(WebcamDetection(session_id=session_record.session_id, frame_timestamp=datetime.utcnow().isoformat(), status=status))
 
@@ -1170,9 +1308,10 @@ def webcam_process_frame():
                 'evidence_message': evidence_message,
                 'index': index,
                 'label': 'Face ' + str(index),
-                'case_id': case_id,
+                'case_id': None,
+                'reference_id': reference_id,
                 'similarity_score': similarity_score,
-                'matched_person': person_json(matched_person) if matched_person and status == 'POTENTIAL_MATCH' else None,
+                'matched_person': webcam_person_json(matched_person) if matched_person and status == 'POTENTIAL_MATCH' else None,
                 'match_id': match_id,
                 'ranked_matches': ranked_candidates,
                 'chart': match_chart,
@@ -1193,7 +1332,7 @@ def webcam_process_frame():
             for face in face_results
         ]
         results = [
-            {'face_index': face['index'], 'face_id': face['face_id'], 'status': face['status'], 'evidence_message': face['evidence_message'], 'case_id': face['case_id'], 'similarity_score': face['similarity_score']}
+            {'face_index': face['index'], 'face_id': face['face_id'], 'status': face['status'], 'evidence_message': face['evidence_message'], 'reference_id': face['reference_id'], 'similarity_score': face['similarity_score']}
             for face in face_results
         ]
         return jsonify(
@@ -1438,8 +1577,8 @@ def webcam_session_matches(session_id):
         'status': row.status,
         'frame_timestamp': row.frame_timestamp,
         'created_at': row.created_at.isoformat(),
-        'person': person_json(MissingPerson.query.filter_by(case_id=row.case_id).first())
-            if row.case_id and MissingPerson.query.filter_by(case_id=row.case_id).first() else None,
+        'person': webcam_person_json(WebcamPerson.query.filter_by(reference_id=row.case_id).first())
+            if row.case_id and WebcamPerson.query.filter_by(reference_id=row.case_id).first() else None,
     } for row in rows])
 
 
@@ -1451,35 +1590,7 @@ def create_webcam_review(session_id):
         return api_error('Webcam session not found.', 404)
     if not can_access_webcam_session(session_record):
         return api_error('You do not have permission to request review for this webcam session.', 403)
-    payload = request.get_json(silent=True) or {}
-    case_id = (payload.get('case_id') or '').strip()
-    person = MissingPerson.query.filter_by(case_id=case_id).first() if case_id else None
-    if not person:
-        return api_error('The related missing-person case could not be found.', 404)
-    match = AIMatch.query.filter_by(
-        source_type='WEBCAM', source_id=session_record.id,
-        missing_person_id=person.id,
-    ).order_by(AIMatch.created_at.desc()).first()
-    if match and normalize_match_status(match.status) == 'REQUIRES_HUMAN_VERIFICATION':
-        return jsonify(match_id=match.id, status=normalize_match_status(match.status))
-    if match and normalize_match_status(match.status) == 'VERIFIED_BY_AUTHORIZED_USER':
-        return api_error('This webcam lead has already been verified.', 409)
-    if match:
-        return api_error('This webcam lead has already been reviewed.', 409)
-    try:
-        similarity_score = float(payload.get('similarity_score'))
-    except (TypeError, ValueError):
-        return api_error('A similarity score is required for the review record.', 400)
-    if not 0 <= similarity_score <= 100:
-        return api_error('Similarity score must be between 0 and 100.', 400)
-    match = AIMatch(
-        source_type='WEBCAM', source_id=session_record.id,
-        missing_person_id=person.id, similarity_score=similarity_score,
-        combined_score=similarity_score, status='REQUIRES_HUMAN_VERIFICATION',
-    )
-    db.session.add(match)
-    db.session.commit()
-    return jsonify(match_id=match.id, status=normalize_match_status(match.status)), 201
+    return api_error('Webcam-only references do not create or update missing-person case reviews.', 410)
 
 
 @app.get('/api/missing-persons')
@@ -1492,6 +1603,82 @@ def list_people():
     if request.args.get('status'):
         q = q.filter_by(status=request.args['status'])
     return jsonify(items=[person_json(p) for p in q.order_by(MissingPerson.created_at.desc()).all()])
+
+
+@app.get('/api/ai/webcam/references')
+@require_auth({'FAMILY_USER', 'CITIZEN', 'INVESTIGATOR', 'ADMIN_DEMO', 'POLICE_OFFICER'})
+def list_webcam_references():
+    user = current_user()
+    people = WebcamPerson.query.filter_by(
+        status='ACTIVE', registered_by=user.id
+    ).order_by(WebcamPerson.created_at.desc()).all()
+    return jsonify(items=[{**webcam_person_json(person), 'can_delete': True} for person in people])
+
+
+@app.post('/api/ai/webcam/references')
+@require_auth({'FAMILY_USER', 'CITIZEN', 'INVESTIGATOR', 'ADMIN_DEMO', 'POLICE_OFFICER'})
+def create_webcam_reference():
+    photo = None
+    try:
+        photo = save_file(request.files.get('photo'))
+        if not photo:
+            return api_error('A clear face photo is required.')
+        image_path = os.path.join(app.config['UPLOAD_FOLDER'], os.path.basename(photo))
+        vector = webcam_embedding_from_file(image_path)
+        reference_id = next_webcam_reference_id()
+        person = WebcamPerson(
+            reference_id=reference_id,
+            registered_by=current_user().id,
+            name=reference_id,
+            photo=photo,
+            embedding_vector=json.dumps(vector.tolist()),
+            embedding_dimension=int(vector.size),
+            model_name=WEBCAM_FACE_MODEL,
+        )
+        db.session.add(person)
+        db.session.commit()
+        return jsonify(message='Webcam-only reference registered.', person=webcam_person_json(person)), 201
+    except ValueError as error:
+        db.session.rollback()
+        if photo:
+            try:
+                os.remove(os.path.join(app.config['UPLOAD_FOLDER'], os.path.basename(photo)))
+            except OSError:
+                app.logger.exception('Could not remove a rejected webcam reference photo.')
+        return api_error(str(error))
+
+
+@app.delete('/api/ai/webcam/references/<int:reference_id>')
+@require_auth({'FAMILY_USER', 'CITIZEN', 'INVESTIGATOR', 'ADMIN_DEMO', 'POLICE_OFFICER'})
+def delete_webcam_reference(reference_id):
+    person = db.session.get(WebcamPerson, reference_id)
+    if not person:
+        return api_error('Webcam reference not found.', 404)
+    user = current_user()
+    if person.registered_by != user.id:
+        return api_error('Only the account that registered this webcam reference can remove it.', 403)
+    reference_id_text = person.reference_id
+    photo_path = os.path.join(app.config['UPLOAD_FOLDER'], os.path.basename(person.photo or ''))
+    person.status = 'INACTIVE'
+    person.name = reference_id_text
+    person.age = None
+    person.gender = None
+    person.description = None
+    person.embedding_vector = '[]'
+    person.embedding_dimension = 0
+    person.model_name = 'DEACTIVATED'
+    WebcamDetection.query.filter_by(case_id=reference_id_text).delete(synchronize_session=False)
+    db.session.commit()
+    invalidate_webcam_case_cache(reference_id_text)
+    try:
+        if photo_path and os.path.isfile(photo_path):
+            os.remove(photo_path)
+        person.photo = ''
+        db.session.commit()
+    except OSError:
+        app.logger.exception('Could not erase the deactivated webcam reference photo %s.', reference_id_text)
+        return api_error('The reference was deactivated and its face data was erased, but its photo file could not be removed. Check server file permissions.', 500)
+    return jsonify(message='Webcam reference removed. Its photo, profile details, face data, and saved match records were erased.')
 
 
 @app.post('/api/missing-persons')
@@ -2186,4 +2373,4 @@ def spa(e):
 if __name__ == '__main__':
     with app.app_context():
         db.create_all()
-    app.run(debug=True, use_reloader=False)
+    app.run(debug=True, use_reloader=True)

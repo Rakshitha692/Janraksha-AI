@@ -41,6 +41,14 @@
 .webcam-match-photo { width: 82px; height: 96px; flex: 0 0 82px; object-fit: cover; border-radius: 8px; background: #edf2f7; }
 .webcam-match-details { display: grid; gap: 4px; }
 .webcam-review-note { color: #52677c; font-size: .9rem; }
+.webcam-registry-panel { margin-bottom: 1rem; }
+.webcam-reference-form { display: grid; gap: .65rem; max-width: 760px; }
+.webcam-reference-form label { margin-bottom: 0; }
+.webcam-reference-list { display: grid; gap: .6rem; margin-top: 1rem; }
+.webcam-reference-row { display: flex; align-items: center; gap: .8rem; padding: .65rem; border: 1px solid #dce4eb; border-radius: 9px; background: #fff; }
+.webcam-reference-row img { width: 54px; height: 60px; object-fit: cover; border-radius: 7px; background: #edf2f7; }
+.webcam-reference-row div { display: grid; gap: 3px; min-width: 0; flex: 1; }
+.webcam-reference-row small { color: #52677c; overflow-wrap: anywhere; }
 .webcam-source-tools { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 1rem; }
 .webcam-source-form { display: grid; align-content: start; gap: .45rem; padding: 1rem; border: 1px solid #dce4eb; border-radius: 10px; background: #f8fafc; }
 .webcam-source-form label { margin: 0; }
