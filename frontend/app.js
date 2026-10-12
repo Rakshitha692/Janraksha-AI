@@ -107,9 +107,17 @@ async function webcamSearch(el){
   referenceList.addEventListener('click',async event=>{
     const button=event.target.closest('[data-remove-webcam-reference]');
     if(!button)return;
-    button.disabled=true;
-    try{const result=await api(`/api/ai/webcam/references/${button.dataset.removeWebcamReference}`,{method:'DELETE'});toast(result.message);await refreshWebcamReferences()}
-    catch(error){toast(error.message);button.disabled=false}
+    event.preventDefault();event.stopPropagation();
+    const row=button.closest('.webcam-reference-row');
+    const originalText=button.textContent;
+    button.disabled=true;button.textContent='Removing…';
+    try{
+      const result=await api(`/api/ai/webcam/references/${encodeURIComponent(button.dataset.removeWebcamReference)}`,{method:'DELETE'});
+      row?.remove();
+      if(!referenceList.querySelector('.webcam-reference-row'))referenceList.innerHTML='<div class="empty">No webcam-only registrations yet. Add a clear face photo before scanning.</div>';
+      toast(result.message||'Webcam reference removed.');
+      void refreshWebcamReferences().catch(error=>toast(`Removed, but the list could not refresh: ${error.message}`));
+    }catch(error){toast(error.message);button.disabled=false;button.textContent=originalText}
   });
   let capturedFaces=[];
   function renderCapturedFaceBoxes(faces=[]){
