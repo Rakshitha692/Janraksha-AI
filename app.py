@@ -3,7 +3,7 @@ import hashlib
 import ipaddress
 import socket
 from urllib.parse import urlsplit
-from threading import Lock
+from threading import Lock, Thread, Event
 import time
 from email.message import EmailMessage
 from datetime import datetime, date, timedelta
@@ -12,7 +12,7 @@ from io import BytesIO
 
 import cv2
 import numpy as np
-from flask import Flask, jsonify, request, session, send_from_directory
+from flask import Flask, Response, jsonify, request, session, send_from_directory, stream_with_context
 from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -74,6 +74,8 @@ if not 0 <= app.config['POTENTIAL_MATCH_THRESHOLD'] <= 1:
 db = SQLAlchemy(app)
 webcam_tracks = {}
 webcam_tracks_lock = Lock()
+remote_webcam_captures = {}
+remote_webcam_captures_lock = Lock()
 
 ROLES = {'FAMILY_USER', 'CITIZEN', 'INVESTIGATOR', 'ADMIN_DEMO', 'POLICE_OFFICER'}
 PUBLIC_REGISTRATION_ROLES = {'FAMILY_USER', 'CITIZEN', 'INVESTIGATOR'}
@@ -431,7 +433,11 @@ def _get_webcam_face_models():
         if not hasattr(cv2, 'FaceDetectorYN') or not hasattr(cv2, 'FaceRecognizerSF'):
             raise ValueError('Webcam face recognition needs OpenCV 4.10 or newer. Install requirements.txt and restart JanRaksha.')
         try:
-            detector = cv2.FaceDetectorYN.create(detector_path, '', (320, 320), 0.8, 0.3, 5000)
+            # Video frames can be compressed, motion-blurred, and much smaller
+            # than registration photos. A lower detector cutoff catches those
+            # faces; quality checks and the SFace match threshold still reject
+            # weak identity evidence later in the pipeline.
+            detector = cv2.FaceDetectorYN.create(detector_path, '', (320, 320), 0.65, 0.3, 5000)
             recognizer = cv2.FaceRecognizerSF.create(recognizer_path, '')
         except cv2.error as error:
             raise ValueError(f'Could not load the webcam face recognition models: {error}') from error
@@ -1279,20 +1285,21 @@ def webcam_process_frame():
                     matches = search_webcam_people(embedding, current_user().id)
                     if matches:
                         best = max(matches, key=lambda candidate: candidate['similarity'])
-                        status = 'POTENTIAL_MATCH' if best['cosine'] >= WEBCAM_FACE_COSINE_THRESHOLD else 'NO_RELEVANT_MATCH'
+                        qualified_matches = [candidate for candidate in matches if candidate['cosine'] >= WEBCAM_FACE_COSINE_THRESHOLD]
+                        status = 'POTENTIAL_MATCH' if qualified_matches else 'NO_RELEVANT_MATCH'
                         if status == 'POTENTIAL_MATCH':
                             matched_person = best['person']
                             similarity_score = float(best['similarity'])
                             reference_id = matched_person.reference_id
                             ranked_candidates = [{
                                 'case': {
-                                    **webcam_person_json(matched_person),
-                                    'case_id': matched_person.reference_id,
+                                    **webcam_person_json(candidate['person']),
+                                    'case_id': candidate['person'].reference_id,
                                 },
-                                'similarity_score': best['similarity'],
+                                'similarity_score': candidate['similarity'],
                                 'status': 'WEBCAM_ONLY_REFERENCE',
                                 'match_id': None,
-                            }]
+                            } for candidate in qualified_matches]
                         evidence_message = 'AI Evidence Indicator: webcam-only reference lead requires human review.' if status == 'POTENTIAL_MATCH' else 'AI Evidence Indicator: no relevant match in the webcam-only reference set.'
                     else:
                         evidence_message = 'AI Evidence Indicator: no relevant match in the webcam-only reference set.'
@@ -1377,23 +1384,198 @@ def _process_video_frame(session_id, user_id, frame):
         return response.get_json()
 
 
+def _phone_webcam_capture_loop(state):
+    """Drain the phone stream continuously so old buffered frames never pile up."""
+    last_jpeg_at = 0.0
+    while not state['stop'].is_set():
+        ok, frame = state['capture'].read()
+        if not ok or frame is None:
+            if not state['stop'].is_set():
+                state['error'] = 'The phone webcam stream stopped. Check IP Webcam on your phone and reconnect.'
+            break
+        now = time.monotonic()
+        with state['lock']:
+            state['latest_frame'] = frame
+            state['sequence'] += 1
+            sequence = state['sequence']
+        if now - last_jpeg_at >= 1 / 12:
+            encoded_ok, encoded = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+            if encoded_ok:
+                with state['lock']:
+                    state['latest_jpeg'] = encoded.tobytes()
+                    state['jpeg_sequence'] = sequence
+                last_jpeg_at = now
+
+
+@app.get('/api/ai/webcam/phone-preview/<session_id>')
+@require_auth({'FAMILY_USER', 'CITIZEN', 'INVESTIGATOR', 'ADMIN_DEMO', 'POLICE_OFFICER'})
+def webcam_phone_preview(session_id):
+    session_record = WebcamSession.query.filter_by(session_id=session_id).first()
+    if not session_record:
+        return api_error('Phone webcam session not found.', 404)
+    if not can_access_webcam_session(session_record):
+        return api_error('You do not have permission to access this phone webcam session.', 403)
+    with remote_webcam_captures_lock:
+        state = remote_webcam_captures.get(session_id)
+    if not state:
+        return api_error('Phone webcam stream is no longer available. Reconnect the phone.', 410)
+
+    @stream_with_context
+    def generate_frames():
+        last_sequence = -1
+        while not state['stop'].is_set():
+            with state['lock']:
+                jpeg = state['latest_jpeg']
+                sequence = state['jpeg_sequence']
+            if jpeg and sequence != last_sequence:
+                last_sequence = sequence
+                yield (b'--frame\r\nContent-Type: image/jpeg\r\nContent-Length: '
+                       + str(len(jpeg)).encode('ascii') + b'\r\n\r\n' + jpeg + b'\r\n')
+            elif state.get('error'):
+                break
+            time.sleep(1 / 24)
+
+    return Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame', headers={
+        'Cache-Control': 'no-cache, no-store, must-revalidate',
+        'Pragma': 'no-cache',
+        'X-Accel-Buffering': 'no',
+    })
+
+
+@app.post('/api/ai/webcam/connect-phone')
+@require_auth({'FAMILY_USER', 'CITIZEN', 'INVESTIGATOR', 'ADMIN_DEMO', 'POLICE_OFFICER'})
+def webcam_connect_phone():
+    payload = request.get_json(silent=True) or {}
+    stream_url = (payload.get('stream_url') or '').strip()
+    try:
+        parsed = urlsplit(stream_url)
+        host = parsed.hostname or ''
+        address = ipaddress.ip_address(host)
+        parsed.port  # Validate any supplied port number.
+    except (ValueError, TypeError):
+        return api_error('Enter the IP Webcam address, such as http://192.168.1.25:8080/videofeed.', 400)
+    if parsed.scheme.lower() not in {'http', 'https'} or not address.is_private or address.is_loopback or address.is_link_local or address.is_multicast or address.is_unspecified or parsed.username or parsed.password:
+        return api_error('For phone webcam connection, use its private Wi-Fi IP address and HTTP(S) video URL.', 400)
+
+    video_path = parsed.path if parsed.path and parsed.path != '/' else '/videofeed'
+    # IP Webcam normally serves the LAN stream over plain HTTP, even when its
+    # home URL was copied into the field with an https:// prefix.
+    schemes = ['http', 'https']
+    capture = None
+    for scheme in schemes:
+        candidate_url = parsed._replace(scheme=scheme, path=video_path).geturl()
+        try:
+            candidate = cv2.VideoCapture(
+                candidate_url,
+                cv2.CAP_FFMPEG,
+                [cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 5000, cv2.CAP_PROP_READ_TIMEOUT_MSEC, 5000],
+            )
+        except (TypeError, cv2.error):
+            candidate = cv2.VideoCapture(candidate_url)
+        if candidate and candidate.isOpened():
+            try:
+                candidate.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            except cv2.error:
+                pass
+            first_frame_ok, first_frame = candidate.read()
+            if first_frame_ok:
+                capture = candidate
+                break
+        if candidate:
+            candidate.release()
+    if not capture:
+        return api_error('Could not read the phone video stream. Start IP Webcam, use its /videofeed URL over HTTP, and keep both devices on the same Wi-Fi.', 400)
+    frame_width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+    frame_height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+
+    session_record = WebcamSession(
+        session_id=next_webcam_session_id(),
+        investigator_id=current_user().id,
+        monitoring_description='Phone IP Webcam live stream',
+        status='ACTIVE',
+    )
+    try:
+        db.session.add(session_record)
+        db.session.commit()
+    except Exception:
+        capture.release()
+        db.session.rollback()
+        raise
+    encoded_ok, encoded = cv2.imencode('.jpg', first_frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+    if not encoded_ok:
+        capture.release()
+        session_record.status = 'STOPPED'
+        session_record.ended_at = datetime.utcnow()
+        db.session.commit()
+        return api_error('Could not prepare the phone webcam preview.', 500)
+    state = {
+        'capture': capture,
+        'stop': Event(),
+        'lock': Lock(),
+        'latest_frame': first_frame,
+        'latest_jpeg': encoded.tobytes(),
+        'sequence': 1,
+        'jpeg_sequence': 1,
+        'error': None,
+    }
+    worker = Thread(target=_phone_webcam_capture_loop, args=(state,), daemon=True)
+    state['thread'] = worker
+    with remote_webcam_captures_lock:
+        remote_webcam_captures[session_record.session_id] = state
+    worker.start()
+    return jsonify(success=True, session_id=session_record.session_id, frame_width=frame_width, frame_height=frame_height, message='Phone webcam connected.')
+
+
+@app.post('/api/ai/webcam/process-phone-frame')
+@require_auth({'FAMILY_USER', 'CITIZEN', 'INVESTIGATOR', 'ADMIN_DEMO', 'POLICE_OFFICER'})
+def webcam_process_phone_frame():
+    payload = request.get_json(silent=True) or {}
+    session_id = (payload.get('session_id') or '').strip()
+    session_record = WebcamSession.query.filter_by(session_id=session_id).first() if session_id else None
+    if not session_record:
+        return api_error('Phone webcam session not found.', 404)
+    if not can_access_webcam_session(session_record):
+        return api_error('You do not have permission to access this phone webcam session.', 403)
+    if session_record.status != 'ACTIVE':
+        return api_error('This phone webcam session is no longer active.', 409)
+    with remote_webcam_captures_lock:
+        state = remote_webcam_captures.get(session_id)
+    if not state:
+        return api_error('The phone webcam stream stopped. Check IP Webcam on your phone and reconnect.', 503)
+    with state['lock']:
+        frame = state['latest_frame'].copy() if state['latest_frame'] is not None else None
+        stream_error = state.get('error')
+    if stream_error:
+        return api_error(stream_error, 503)
+    if frame is None:
+        return api_error('The phone webcam stream stopped. Check IP Webcam on your phone and reconnect.', 503)
+    result = _process_video_frame(session_id, current_user().id, frame)
+    if not result:
+        return api_error('Could not analyze the latest phone webcam frame.', 500)
+    return jsonify(result)
+
+
 def _scan_video_capture(capture, session_record, is_live_stream=False):
     user_id = current_user().id
     fps = float(capture.get(cv2.CAP_PROP_FPS) or 0)
     frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
     duration = frame_count / fps if fps > 0 and frame_count > 0 else 0
     max_seconds = max(10, int(os.environ.get('MAX_VIDEO_SCAN_SECONDS', '120')))
-    max_samples = max(1, min(60, int(os.environ.get('MAX_VIDEO_SAMPLE_FRAMES', '24'))))
+    max_samples = max(1, min(60, int(os.environ.get('MAX_VIDEO_SAMPLE_FRAMES', '60'))))
     if is_live_stream:
         positions = [None] * min(max_samples, 10)
     elif duration > 0:
         scan_duration = min(duration, max_seconds)
         sample_count = min(max_samples, max(1, int(scan_duration / 2) + 1))
         positions = [int((scan_duration * index / max(1, sample_count - 1)) * 1000) for index in range(sample_count)]
+    elif fps > 0:
+        # Some HTTP video sources omit frame-count metadata. Seek at regular
+        # intervals instead of examining only the first two seconds.
+        positions = [int(index * max_seconds * 1000 / max_samples) for index in range(max_samples)]
     else:
         positions = [None] * max_samples
 
-    best_match = None
+    best_matches_by_reference = {}
     samples_processed = 0
     for timestamp_ms in positions:
         if timestamp_ms is not None:
@@ -1416,14 +1598,23 @@ def _scan_video_capture(capture, session_record, is_live_stream=False):
         for face in result.get('faces', []):
             for candidate in face.get('ranked_matches', []):
                 score = float(candidate.get('similarity_score') or 0)
-                if best_match is None or score > best_match['similarity_score']:
-                    best_match = {
+                person = candidate.get('case') or candidate.get('person') or {}
+                reference_id = person.get('reference_id') or person.get('case_id')
+                if not reference_id:
+                    continue
+                if reference_id not in best_matches_by_reference or score > best_matches_by_reference[reference_id]['similarity_score']:
+                    best_matches_by_reference[reference_id] = {
                         **candidate,
                         'similarity_score': score,
                         'timestamp_seconds': round(timestamp_ms / 1000, 1) if timestamp_ms is not None else samples_processed - 1,
                         'face_bbox': face.get('bbox'),
                     }
-    return {'best_match': best_match, 'frames_analyzed': samples_processed}
+    best_matches = sorted(best_matches_by_reference.values(), key=lambda match: match['similarity_score'], reverse=True)
+    return {
+        'best_match': best_matches[0] if best_matches else None,
+        'best_matches': best_matches,
+        'frames_analyzed': samples_processed,
+    }
 
 
 @app.post('/api/ai/webcam/process-video')
@@ -1478,7 +1669,11 @@ def webcam_process_video():
                 )
             except (TypeError, cv2.error):
                 capture = cv2.VideoCapture(stream_url)
-            is_live_stream = True
+            # HTTP(S) links commonly point to seekable video files. Treating
+            # those as live streams only scanned their first few seconds.
+            # RTSP(S) sources are live streams; ordinary HTTP(S) files use the
+            # duration/frame-count sampling path above.
+            is_live_stream = scheme in {'rtsp', 'rtsps'}
         else:
             if not video_file.filename:
                 return api_error('Choose a video file to scan.', 400)
@@ -1504,7 +1699,8 @@ def webcam_process_video():
             session_id=session_record.session_id,
             frames_analyzed=scan['frames_analyzed'],
             best_match=scan['best_match'],
-            message='Video scan completed.' if scan['best_match'] else 'No similar registered person was found in the sampled frames.',
+            best_matches=scan['best_matches'],
+            message='Video scan completed.' if scan['best_matches'] else 'No similar registered person was found in the sampled frames.',
         )
     except (ValueError, cv2.error) as exc:
         db.session.rollback()
@@ -1534,6 +1730,14 @@ def webcam_stop():
     if not can_access_webcam_session(session_record):
         return api_error('You do not have permission to access this webcam session.', 403)
     session_record.status = 'STOPPED'; session_record.ended_at = datetime.utcnow(); db.session.commit()
+    with remote_webcam_captures_lock:
+        remote_state = remote_webcam_captures.pop(session_record.session_id, None)
+    if remote_state:
+        remote_state['stop'].set()
+        remote_state['capture'].release()
+        worker = remote_state.get('thread')
+        if worker and worker.is_alive():
+            worker.join(timeout=1)
     with webcam_tracks_lock:
         webcam_tracks.pop(session_record.session_id, None)
     return jsonify(success=True, message='Webcam monitoring stopped.', session={'session_id': session_record.session_id, 'status': session_record.status})

@@ -8,12 +8,12 @@ async function enablePhoneNotifications(button){const status=$('#phoneNotificati
 function showAuth(which){$('#authView').classList.remove('d-none');$('#loginModal').classList.toggle('d-none',which!=='login');$('#registerModal').classList.toggle('d-none',which!=='register')};function hideAuth(){$('#loginModal').classList.add('d-none');$('#registerModal').classList.add('d-none')}
 $('#loginForm').onsubmit=async e=>{e.preventDefault();try{let f=new FormData(e.target);await api('/api/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(Object.fromEntries(f))});boot()}catch(x){toast(x.message)}};
 $('#registerForm').onsubmit=async e=>{e.preventDefault();try{let f=new FormData(e.target),d=Object.fromEntries(f);d.terms=f.get('terms')==='on';await api('/api/auth/register',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)});boot()}catch(x){toast(x.message)}};
-async function boot(){try{me=(await api('/api/users/me')).user}catch{if(window.location.pathname==='/police'){me=null;$('#authView').classList.add('d-none');$('#appView').classList.remove('d-none');$('aside').classList.add('d-none');$('.workspace').style.marginLeft='0';$('#userName').textContent='';$('#roleBadge').textContent='POLICE PORTAL';policePortal($('#page'))}return}$('#authView').classList.add('d-none');hideAuth();$('#appView').classList.remove('d-none');$('#userName').textContent=me.name;$('#roleBadge').textContent=me.role.replace('_',' ');if(window.location.pathname==='/police'){if(['POLICE_OFFICER','ADMIN_DEMO'].includes(me.role)){showPolicePortalShell();return policePortal($('#page'))}$('aside').classList.add('d-none');$('.workspace').style.marginLeft='0';me=null;return policePortal($('#page'))}const matchMatch = window.location.pathname.match(/\/investigator\/matches\/(\d+)/);if(matchMatch && ['INVESTIGATOR','ADMIN_DEMO','FAMILY_USER','CITIZEN'].includes(me.role)){return openInvestigatorMatch(Number(matchMatch[1]));}go(new URLSearchParams(location.search).get('page')==='emergency'?'emergency':'dashboard')}
-document.querySelectorAll('.nav-link[data-page]').forEach(b=>b.onclick=()=>go(b.dataset.page));$('.logout').onclick=async()=>{await api(location.pathname==='/police'?'/api/police/logout':'/api/auth/logout',{method:'POST'});location.reload()};
+async function boot(){try{me=(await api('/api/users/me')).user}catch{if(window.location.pathname==='/police'){me=null;$('#authView').classList.add('d-none');$('#appView').classList.remove('d-none');$('aside').classList.add('d-none');$('.workspace').style.marginLeft='0';$('#userName').textContent='';$('#roleBadge').textContent='POLICE PORTAL';policePortal($('#page'))}return}$('#authView').classList.add('d-none');hideAuth();$('#appView').classList.remove('d-none');$('#userName').textContent=me.name;$('#roleBadge').textContent=me.role.replace('_',' ');document.querySelectorAll('[data-role-nav]').forEach(nav=>nav.classList.toggle('d-none',nav.dataset.roleNav!==(me.role==='FAMILY_USER'?'FAMILY_USER':'CITIZEN')));if(window.location.pathname==='/police'){if(['POLICE_OFFICER','ADMIN_DEMO'].includes(me.role)){showPolicePortalShell();return policePortal($('#page'))}$('aside').classList.add('d-none');$('.workspace').style.marginLeft='0';me=null;return policePortal($('#page'))}const matchMatch = window.location.pathname.match(/\/investigator\/matches\/(\d+)/);if(matchMatch && ['INVESTIGATOR','ADMIN_DEMO','FAMILY_USER','CITIZEN'].includes(me.role)){return openInvestigatorMatch(Number(matchMatch[1]));}go(new URLSearchParams(location.search).get('page')==='emergency'?'emergency':'dashboard')}
+document.querySelectorAll('.nav-link[data-page]').forEach(b=>b.onclick=()=>go(b.dataset.page));document.querySelectorAll('.logout').forEach(button=>button.onclick=async()=>{await api(location.pathname==='/police'?'/api/police/logout':'/api/auth/logout',{method:'POST'});location.reload()});
 const heading=(t,s='')=>`<h1 class="page-title">${t}</h1><p class="page-subtitle">${s}</p>`;
 async function go(page){clearInterval(policeRefreshTimer);policeRefreshTimer=null;const activePage=['emergency','emergency-center'].includes(page)?'emergency-community':page;document.querySelectorAll('.nav-link').forEach(x=>x.classList.toggle('active',x.dataset.page===activePage));let el=$('#page');el.innerHTML='<div class="empty">Loading…</div>';try{if(page==='dashboard'){if(location.pathname==='/police'&&me&&['POLICE_OFFICER','ADMIN_DEMO'].includes(me.role)){policeDashboard(el);return}await dashboard(el);return}if(page==='cases'){await gallery(el);return}if(page==='register-case'){await caseForm(el);return}if(page==='search'){await search(el);return}if(page==='webcam'){await webcamSearch(el);return}if(page==='sighting'){await sightingForm(el);return}if(page==='found'){await foundForm(el);return}if(page==='notifications'){await notifications(el);return}if(page==='emergency'){await emergency(el,true);return}if(page==='emergency-community'){await emergency(el);return}if(page==='emergency-center'){await emergency(el,true);return}if(page==='police-portal'){await policePortal(el);return}}catch(e){el.innerHTML=`<div class="alert alert-danger">${escapeHtml(e.message)}</div>`}}
 
-const webcamState={stream:null,active:false,starting:false,sessionId:null,processing:false,intervalId:null,facingMode:'user'};
+const webcamState={stream:null,active:false,starting:false,sessionId:null,processing:false,intervalId:null,facingMode:'user',remote:false};
 
 async function webcamSearch(el){
   if (!['FAMILY_USER','CITIZEN','INVESTIGATOR','ADMIN_DEMO','POLICE_OFFICER'].includes(me.role)) {
@@ -39,6 +39,13 @@ async function webcamSearch(el){
           <button class="btn btn-outline-primary" id="captureFrameBtn">Capture frame</button>
           <button class="btn btn-outline-primary" id="switchCameraBtn">Switch camera</button>
         </div>
+        <form id="phoneWebcamConnectForm" class="webcam-source-form mt-3">
+          <label>Connect IP Webcam from your phone
+            <input name="stream_url" type="url" placeholder="http://192.168.1.25:8080/videofeed" required>
+          </label>
+          <button class="btn btn-outline-primary" type="submit">Connect phone webcam</button>
+          <small class="text-muted">Paste the IP Webcam address shown on your phone. JanRaksha adds /videofeed and tries HTTP automatically. Keep both devices on the same Wi-Fi.</small>
+        </form>
         <div class="webcam-source-tools mt-3">
           <form id="webcamVideoScanForm" class="webcam-source-form">
             <label>Upload a video
@@ -58,6 +65,8 @@ async function webcamSearch(el){
       </div>
       <div class="webcam-stage mt-3">
         <video id="webcamVideo" autoplay playsinline muted></video>
+        <img id="phoneWebcamPreview" class="d-none" alt="Live phone webcam stream">
+        <div id="phoneWebcamMessage" class="phone-webcam-message">Start a camera or connect your phone webcam to see its live feed.</div>
         <div id="faceOverlay" class="face-overlay"></div>
       </div>
       <div class="webcam-summary mt-3">
@@ -78,7 +87,9 @@ async function webcamSearch(el){
       <div id="webcamResults" class="webcam-results mt-3"></div>
     </div>
   `;
-  const video=$('#webcamVideo'); const overlay=$('#faceOverlay'); const statusEl=$('#cameraStatus'); const facesEl=$('#facesDetected'); const processEl=$('#processingStatus'); const resultsEl=$('#webcamResults'); const previewEl=$('#capturedFramePreview'); const previewImage=previewEl.querySelector('img'); const previewOverlay=$('#capturedFrameOverlay'); const capturedMatchEl=$('#capturedFrameMatch'); const faceElements=new Map();
+  const video=$('#webcamVideo'); const remotePreview=$('#phoneWebcamPreview'); const phoneMessage=$('#phoneWebcamMessage'); const phoneCameraForm=$('#phoneWebcamConnectForm'); const phoneConnectButton=phoneCameraForm.querySelector('button[type="submit"]'); const overlay=$('#faceOverlay'); const statusEl=$('#cameraStatus'); const facesEl=$('#facesDetected'); const processEl=$('#processingStatus'); const resultsEl=$('#webcamResults'); const previewEl=$('#capturedFramePreview'); const previewImage=previewEl.querySelector('img'); const previewOverlay=$('#capturedFrameOverlay'); const capturedMatchEl=$('#capturedFrameMatch'); const faceElements=new Map(); let latestRemoteFaces=[];
+  remotePreview.onload=()=>{phoneMessage.classList.add('d-none');updateStatus(`Phone connected · ${remotePreview.naturalWidth}×${remotePreview.naturalHeight}`);renderFaceBoxes(latestRemoteFaces)};
+  remotePreview.onerror=()=>{if(webcamState.remote&&webcamState.active){phoneMessage.textContent='Phone video preview disconnected. Check IP Webcam and reconnect.';phoneMessage.classList.remove('d-none')}};
   const referenceList=$('#webcamReferenceList');
   async function refreshWebcamReferences(){
     const data=await api('/api/ai/webcam/references');
@@ -128,6 +139,29 @@ async function webcamSearch(el){
   }
   previewImage.addEventListener('load', () => renderCapturedFaceBoxes(capturedFaces));
   const startButton=$('#startCameraBtn'); const stopButton=$('#stopCameraBtn'); const captureButton=$('#captureFrameBtn'); const switchButton=$('#switchCameraBtn');
+  phoneCameraForm.onsubmit=async event=>{
+    event.preventDefault();
+    if(webcamState.active||webcamState.starting)return;
+    webcamState.starting=true;phoneMessage.textContent='Connecting to IP Webcam...';phoneMessage.classList.remove('d-none');updateStatus('Connecting to phone...');syncWebcamControls();
+    try{
+      const response=await api('/api/ai/webcam/connect-phone',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({stream_url:phoneCameraForm.elements.stream_url.value.trim()})});
+      webcamState.sessionId=response.session_id;webcamState.remote=true;webcamState.active=true;
+      video.style.display='none';remotePreview.classList.remove('d-none');
+      remotePreview.src=`/api/ai/webcam/phone-preview/${encodeURIComponent(response.session_id)}?t=${Date.now()}`;
+      const phoneResolution=response.frame_width&&response.frame_height?`${response.frame_width}×${response.frame_height}`:'';
+      updateStatus(phoneResolution?`Phone connected · ${phoneResolution}`:'Phone connected');
+      phoneMessage.textContent='Connected. Waiting for the first camera frame...';
+      if(webcamState.intervalId)clearInterval(webcamState.intervalId);
+      webcamState.intervalId=setInterval(()=>void processFrame(),1500);
+      syncWebcamControls();
+      await processFrame();
+      toast('Phone webcam connected. Live face detection started.');
+    }catch(error){
+      webcamState.sessionId=null;webcamState.remote=false;webcamState.active=false;
+      phoneMessage.textContent=error.message||'Could not connect to IP Webcam.';phoneMessage.classList.remove('d-none');
+      updateStatus('Connection failed');toast(error.message||'Could not connect to the phone webcam.');
+    }finally{webcamState.starting=false;syncWebcamControls();}
+  };
   async function submitVideoScan(form, useUrl=false){
     const submitButton=form.querySelector('button[type="submit"]');
     submitButton.disabled=true;
@@ -137,43 +171,28 @@ async function webcamSearch(el){
       const response = useUrl
         ? await api('/api/ai/webcam/process-video', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({stream_url:form.elements.stream_url.value.trim()})})
         : await api('/api/ai/webcam/process-video', {method:'POST', body:new FormData(form)});
-      if (response.best_match && String(response.best_match.case?.status || '').toUpperCase().replaceAll(' ', '_') === 'CLOSED') {
-        response.best_match=null;
-        response.message='Closed cases are excluded from video matching.';
-      }
+      const matches=(response.best_matches || (response.best_match ? [response.best_match] : []))
+        .filter(match=>String(match.case?.status || '').toUpperCase().replaceAll(' ', '_') !== 'CLOSED');
       const summary=document.createElement('div');
       summary.className='empty';
       summary.textContent=`Scanned ${response.frames_analyzed} video frame${response.frames_analyzed === 1 ? '' : 's'}.`;
-      if (!response.best_match) {
+      if (!matches.length) {
         resultsEl.replaceChildren(summary, Object.assign(document.createElement('div'), {className:'empty', textContent:response.message}));
         return;
       }
       const result=document.createElement('div');
-      result.className='result webcam-result webcam-result-potential';
-      const note=document.createElement('p');
-      note.className='webcam-review-note';
-      note.textContent=`Highest similarity in the sampled frames at ${response.best_match.timestamp_seconds}s. Human verification is required; similarity is not proof of identity.`;
-      result.appendChild(note);
-      const matchContainer=document.createElement('div');
-      matchContainer.innerHTML=renderWebcamReferenceMatch(response.best_match);
-      result.appendChild(matchContainer);
-      const verifyButton=matchContainer.querySelector('[data-webcam-verify]');
-      if (verifyButton) verifyButton.addEventListener('click', async ()=>{
-        verifyButton.disabled=true;
-        try {
-          let matchId=response.best_match.match_id;
-          if (!matchId) {
-            const review=await api(`/api/ai/webcam/session/${encodeURIComponent(response.session_id)}/review`, {
-              method:'POST', headers:{'Content-Type':'application/json'},
-              body:JSON.stringify({case_id:response.best_match.case.case_id, similarity_score:response.best_match.similarity_score})
-            });
-            matchId=review.match_id;
-          }
-          await openInvestigatorMatch(matchId);
-        } catch (error) {
-          toast(error.message || 'Could not open the verification form.');
-          verifyButton.disabled=false;
-        }
+      result.className='webcam-video-matches';
+      matches.forEach(match=>{
+        const card=document.createElement('div');
+        card.className='panel webcam-result webcam-result-potential';
+        const note=document.createElement('p');
+        note.className='webcam-review-note';
+        note.textContent=`Highest similarity at ${match.timestamp_seconds}s. Human verification is required; similarity is not proof of identity.`;
+        card.appendChild(note);
+        const matchContainer=document.createElement('div');
+        matchContainer.innerHTML=renderWebcamReferenceMatch(match);
+        card.appendChild(matchContainer);
+        result.appendChild(card);
       });
       resultsEl.replaceChildren(summary, result);
     } catch (error) {
@@ -191,14 +210,16 @@ async function webcamSearch(el){
     startButton.disabled = webcamState.starting || webcamState.active;
     stopButton.disabled = webcamState.starting || !webcamState.active;
     captureButton.disabled = !webcamState.active || webcamState.processing;
-    switchButton.disabled = webcamState.starting;
+    switchButton.disabled = webcamState.starting || webcamState.remote;
+    phoneConnectButton.disabled = webcamState.starting || webcamState.active;
   }
   function renderFaceBoxes(faces=[]){
     const activeFaceIds = new Set();
-    const videoRect = video.getBoundingClientRect();
+    const source = webcamState.remote ? remotePreview : video;
+    const videoRect = source.getBoundingClientRect();
     const overlayRect = overlay.getBoundingClientRect();
-    const sourceWidth = video.videoWidth || 640;
-    const sourceHeight = video.videoHeight || 420;
+    const sourceWidth = (webcamState.remote ? remotePreview.naturalWidth : video.videoWidth) || 640;
+    const sourceHeight = (webcamState.remote ? remotePreview.naturalHeight : video.videoHeight) || 420;
     const scale = Math.max(videoRect.width / sourceWidth, videoRect.height / sourceHeight);
     const offsetX = (videoRect.width - sourceWidth * scale) / 2;
     const offsetY = (videoRect.height - sourceHeight * scale) / 2;
@@ -362,19 +383,24 @@ async function webcamSearch(el){
     });
   }
   async function processFrame({manual=false}={}){
-    if (!webcamState.active || webcamState.processing || !video || !video.videoWidth) return;
+    if (!webcamState.active || webcamState.processing || (!webcamState.remote && (!video || !video.videoWidth))) return;
     webcamState.processing = true; setProcessing(manual ? 'Capturing and analyzing frame…' : 'Active');
     try {
+      let data, framePreview;
+      if (webcamState.remote) {
+        data=await api('/api/ai/webcam/process-phone-frame',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:webcamState.sessionId})});
+      } else {
       const canvas = document.createElement('canvas');
       canvas.width = video.videoWidth; canvas.height = video.videoHeight;
       const ctx = canvas.getContext('2d');
       if (!ctx) throw new Error('Could not prepare a webcam frame. Try reloading the page.');
       ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      framePreview=canvas.toDataURL('image/jpeg',0.95);
       if (manual) {
         capturedFaces = [];
         previewOverlay.replaceChildren();
         capturedMatchEl.textContent = 'Finding the highest similarity result…';
-        previewImage.src = canvas.toDataURL('image/jpeg', 0.95);
+        previewImage.src = framePreview;
         previewEl.classList.remove('d-none');
       }
       const blob = await new Promise((resolve, reject) => {
@@ -383,9 +409,11 @@ async function webcamSearch(el){
         canvas.toBlob(frame => frame ? resolve(frame) : reject(new Error('Could not capture a webcam frame.')), 'image/jpeg', 0.95);
       });
       const form = new FormData(); form.append('frame', blob, 'webcam-frame.jpg'); form.append('session_id', webcamState.sessionId);
-      const data = await api('/api/ai/webcam/process-frame', {method:'POST', body:form});
+      data = await api('/api/ai/webcam/process-frame', {method:'POST', body:form});
+      }
       if (!webcamState.active) return;
       const faces = removeClosedWebcamMatches(data.faces || []);
+      if(webcamState.remote)latestRemoteFaces=faces;
       renderFaceBoxes(faces);
       if (manual) {
         capturedFaces = faces;
@@ -406,6 +434,8 @@ async function webcamSearch(el){
       if (manual) toast(faces.length ? 'Frame captured and analyzed.' : 'Frame captured. No face was detected. Try a clearer, well-lit view.');
     } catch (error) {
       toast(error.message || 'Webcam frame processing failed.');
+      if(webcamState.remote){phoneMessage.textContent=error.message||'The phone camera frame could not be read.';phoneMessage.classList.remove('d-none');}
+      if(webcamState.remote && String(error.message||'').toLowerCase().includes('phone webcam stream stopped'))void stopWebcam();
     } finally {
       webcamState.processing = false; setProcessing('Idle'); syncWebcamControls();
     }
@@ -418,6 +448,7 @@ async function webcamSearch(el){
       return;
     }
     webcamState.starting = true;
+    webcamState.remote=false;remotePreview.classList.add('d-none');video.style.display='';
     updateStatus('Requesting camera access…');
     syncWebcamControls();
     let stream;
@@ -431,6 +462,7 @@ async function webcamSearch(el){
       });
       video.srcObject = stream;
       await video.play();
+      phoneMessage.classList.add('d-none');
       // Ask supported cameras to keep focus on faces at changing distances.
       const videoTrack = stream.getVideoTracks()[0];
       if (videoTrack && videoTrack.getCapabilities && videoTrack.applyConstraints) {
@@ -484,7 +516,7 @@ async function webcamSearch(el){
     if (webcamState.sessionId) {
       try { await api('/api/ai/webcam/stop', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({session_id: webcamState.sessionId})}); } catch (error) { toast(error.message); }
     }
-    webcamState.active = false; webcamState.sessionId = null; webcamState.processing = false; updateStatus('Inactive'); setProcessing('Idle'); video.srcObject = null; overlay.innerHTML=''; faceElements.clear(); resultsEl.innerHTML = '<div class="empty">Camera stopped. Press Start camera to resume monitoring.</div>';
+    webcamState.active = false; webcamState.remote=false; webcamState.sessionId = null; webcamState.processing = false; updateStatus('Inactive'); setProcessing('Idle'); video.srcObject = null;video.style.display='';remotePreview.src='';remotePreview.classList.add('d-none');phoneMessage.textContent='Start a camera or connect your phone webcam to see its live feed.';phoneMessage.classList.remove('d-none');overlay.innerHTML=''; faceElements.clear(); resultsEl.innerHTML = '<div class="empty">Camera stopped. Press Start camera or connect the phone webcam to resume monitoring.</div>';
     facesEl.textContent = '0';
     syncWebcamControls();
   }
@@ -493,7 +525,7 @@ async function webcamSearch(el){
       toast('Start the camera before capturing a frame.');
       return;
     }
-    if (!video || !video.videoWidth) {
+    if (webcamState.remote ? !remotePreview.naturalWidth : (!video || !video.videoWidth)) {
       toast('The camera is starting. Wait until the live preview appears, then capture a frame.');
       return;
     }
@@ -775,7 +807,7 @@ async function emergency(el, centerOnly=false){
 
 function policePortal(el){
   if(me&&['POLICE_OFFICER','ADMIN_DEMO'].includes(me.role))return policeDashboard(el);
-  el.innerHTML=heading('Police Portal','Sign in with your authorized Police ID or registered email.')+`<form id="policeLoginForm" class="panel form-panel police-login-form"><div id="policeLoginError" role="alert"></div><label>Police ID or registered email<input name="identifier" autocomplete="username" required></label><label>Password<input name="password" type="password" autocomplete="current-password" required></label><button class="btn btn-primary" type="submit">Police Portal login</button></form>`;
+  el.innerHTML=`<div class="police-login-page">${heading('Police Portal','Sign in with your authorized Police ID or registered email.')}<form id="policeLoginForm" class="panel form-panel police-login-form"><div id="policeLoginError" role="alert"></div><label>Police ID or registered email<input name="identifier" autocomplete="username" required></label><label>Password<input name="password" type="password" autocomplete="current-password" required></label><button class="btn btn-primary" type="submit">Police Portal login</button></form></div>`;
   $('#policeLoginForm').onsubmit=async event=>{
     event.preventDefault();
     const form=event.target,button=form.querySelector('button[type="submit"]');
