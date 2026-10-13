@@ -14,6 +14,7 @@ import cv2
 import numpy as np
 from flask import Flask, Response, jsonify, request, session, send_from_directory, stream_with_context
 from flask_sqlalchemy import SQLAlchemy
+from sqlalchemy import inspect, text
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
@@ -125,9 +126,17 @@ class WebcamPerson(db.Model):
 
 
 class Sighting(db.Model):
-    id = db.Column(db.Integer, primary_key=True); case_id = db.Column(db.String(20)); reported_by = db.Column(db.Integer, db.ForeignKey('user.id'))
-    photo = db.Column(db.String(255)); description = db.Column(db.Text); location_name = db.Column(db.String(200))
-    reported_at = db.Column(db.DateTime, default=datetime.utcnow); status = db.Column(db.String(30), default='SUBMITTED')
+    id = db.Column(db.Integer, primary_key=True)
+    case_id = db.Column(db.String(20), nullable=False, index=True)
+    reported_by = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False, index=True)
+    photo = db.Column(db.String(255))
+    description = db.Column(db.Text)
+    location_name = db.Column(db.String(200))
+    sighting_date = db.Column(db.Date)
+    sighting_time = db.Column(db.String(10))
+    reported_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False, index=True)
+    status = db.Column(db.String(30), default='SUBMITTED', nullable=False)
+    review_status = db.Column(db.String(30), default='PENDING_REVIEW', nullable=False, index=True)
 
 
 class FoundPerson(db.Model):
@@ -152,6 +161,7 @@ class Timeline(db.Model):
 class Notification(db.Model):
     id = db.Column(db.Integer, primary_key=True); user_id = db.Column(db.Integer, db.ForeignKey('user.id')); title = db.Column(db.String(150)); message = db.Column(db.Text)
     type = db.Column(db.String(30), default='info'); is_read = db.Column(db.Boolean, default=False); created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    sighting_id = db.Column(db.Integer, db.ForeignKey('sighting.id'), index=True)
 
 
 class EmailNotification(db.Model):
@@ -310,7 +320,7 @@ def require_auth(roles=None):
 
 
 def user_json(u):
-    return {'id': u.id, 'name': u.name, 'email': u.email, 'role': u.role, 'location': u.location}
+    return {'id': u.id, 'name': u.name, 'email': u.email, 'phone': u.phone, 'role': u.role, 'location': u.location}
 
 
 def person_json(p):
@@ -357,6 +367,19 @@ def save_file(file):
     os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
     file.save(os.path.join(app.config['UPLOAD_FOLDER'], name))
     return f'/uploads/{name}'
+
+
+def save_sighting_photo(file):
+    if not file or not file.filename:
+        return None
+    ext = os.path.splitext(secure_filename(file.filename))[1].lower()
+    if ext not in {'.jpg', '.jpeg', '.png'}:
+        raise ValueError('Only JPG, JPEG and PNG images are accepted.')
+    name = f'{uuid.uuid4().hex}{ext}'
+    folder = os.path.join(app.config['UPLOAD_FOLDER'], 'sightings')
+    os.makedirs(folder, exist_ok=True)
+    file.save(os.path.join(folder, name))
+    return f'sightings/{name}'
 
 
 def save_emergency_attachment(file):
@@ -1012,9 +1035,37 @@ def investigator_match_page(match_id):
     return send_app_index()
 
 
+def can_access_sighting(report, user):
+    if not report or not user:
+        return False
+    if user.role in {'POLICE_OFFICER', 'ADMIN_DEMO'} or report.reported_by == user.id:
+        return True
+    case = MissingPerson.query.filter_by(case_id=report.case_id).first()
+    return bool(user.role == 'FAMILY_USER' and case and case.registered_by == user.id)
+
+
+def sighting_json(report):
+    return {
+        'id': report.id,
+        'case_id': report.case_id,
+        'location_name': report.location_name,
+        'sighting_date': report.sighting_date.isoformat() if report.sighting_date else None,
+        'sighting_time': report.sighting_time,
+        'description': report.description,
+        'photo_url': f'/api/sightings/{report.id}/photo' if report.photo else None,
+        'submitted_at': report.reported_at.isoformat() if report.reported_at else None,
+        'submission_status': report.status,
+        'review_status': report.review_status or 'PENDING_REVIEW',
+    }
+
+
 @app.get('/uploads/<path:name>')
 def uploads(name):
-    if name.replace('\\', '/').lstrip('/').startswith('emergency-cases/'):
+    normalized_name = name.replace('\\', '/').lstrip('/')
+    if normalized_name.startswith(('emergency-cases/', 'sightings/')):
+        return api_error('Resource not found.', 404)
+    sighting = Sighting.query.filter_by(photo=f'/uploads/{name}').first()
+    if sighting and not can_access_sighting(sighting, current_user()):
         return api_error('Resource not found.', 404)
     webcam_reference = WebcamPerson.query.filter_by(photo=f'/uploads/{name}').first()
     if webcam_reference:
@@ -1108,7 +1159,7 @@ def create_police_officer():
 
 @app.post('/api/auth/login')
 def login():
-    d = request.get_json() or {}; u = User.query.filter_by(email=(d.get('email') or '').lower()).first()
+    d = request.get_json() or {}; email = str(d.get('email') or '').strip().lower(); u = User.query.filter_by(email=email).first()
     if not u or not check_password_hash(u.password_hash, d.get('password', '')):
         return api_error('Invalid email or password.', 401)
     if u.role == 'POLICE_OFFICER':
@@ -1126,6 +1177,33 @@ def logout():
 @require_auth()
 def me():
     return jsonify(user=user_json(current_user()))
+
+
+@app.put('/api/users/me')
+@require_auth()
+def update_my_profile():
+    user = current_user()
+    data = request.get_json() or {}
+    name = str(data.get('name') or '').strip()
+    phone = str(data.get('phone') or '').strip()
+    location = str(data.get('location') or '').strip()
+    new_password = str(data.get('new_password') or '')
+    current_password = str(data.get('current_password') or '')
+    if not name or len(name) > 120:
+        return api_error('Name is required and must be 120 characters or fewer.')
+    if len(phone) > 30 or len(location) > 180:
+        return api_error('Phone or location exceeds the allowed length.')
+    if new_password:
+        if len(new_password) < 8:
+            return api_error('New password must contain at least 8 characters.')
+        if not current_password or not check_password_hash(user.password_hash, current_password):
+            return api_error('Enter your current password to change it.', 403)
+        user.password_hash = generate_password_hash(new_password)
+    user.name = name
+    user.phone = phone or None
+    user.location = location or None
+    db.session.commit()
+    return jsonify(message='Profile updated.', user=user_json(user))
 
 
 @app.get('/api/push/public-key')
@@ -1967,22 +2045,151 @@ def ai_search():
         return api_error(str(e))
 
 
-@app.post('/api/sightings')
+@app.get('/api/my-cases')
+@require_auth({'FAMILY_USER'})
+def my_cases():
+    rows = MissingPerson.query.filter_by(registered_by=current_user().id).order_by(MissingPerson.created_at.desc()).all()
+    return jsonify(items=[person_json(person) for person in rows])
+
+
+@app.get('/api/my-reports')
 @require_auth()
+def my_reports():
+    user = current_user()
+    items = []
+    for report in Sighting.query.filter_by(reported_by=user.id).order_by(Sighting.reported_at.desc()).all():
+        items.append({'kind':'Sighting','reference':report.case_id or '', 'status':report.status or 'SUBMITTED', 'summary':report.description or 'Sighting report submitted for review.', 'location':report.location_name, 'created_at':report.reported_at.isoformat() if report.reported_at else None})
+    for report in FoundPerson.query.filter_by(reported_by=user.id).order_by(FoundPerson.created_at.desc()).all():
+        items.append({'kind':'Found person','reference':f'Report #{report.id}', 'status':report.verification_status or report.status or 'PENDING_HUMAN_REVIEW', 'summary':report.description or 'Found-person report submitted for human review.', 'location':report.location_name, 'created_at':report.created_at.isoformat() if report.created_at else None})
+    for person in MissingPerson.query.filter_by(registered_by=user.id).order_by(MissingPerson.created_at.desc()).all():
+        items.append({'kind':'Missing person case','reference':person.case_id, 'status':person.status or 'ACTIVE', 'summary':f'Case registered for {person.name}.', 'location':person.last_seen_location, 'created_at':person.created_at.isoformat() if person.created_at else None})
+    for report in EmergencyCase.query.filter_by(reporter_user_id=user.id).order_by(EmergencyCase.created_at.desc()).all():
+        items.append({'kind':f'Emergency - {report.category.replace("_", " ")}', 'reference':report.case_id, 'status':report.status, 'summary':report.description, 'location':report.location_name, 'created_at':report.created_at.isoformat() if report.created_at else None})
+    items.sort(key=lambda item:item['created_at'] or '', reverse=True)
+    return jsonify(items=items)
+
+
+@app.post('/api/sightings')
+@require_auth({'CITIZEN', 'FAMILY_USER'})
 def sighting():
+    photo = None
     try:
-        d = request.form
-        case_id = (d.get('case_id') or '').strip().upper()
+        data = request.form
+        case_id = (data.get('case_id') or '').strip().upper()
         case = MissingPerson.query.filter(db.func.upper(MissingPerson.case_id) == case_id).first() if case_id else None
         if not case:
             return api_error('No missing-person case matches that ID. Enter the JR-YYYY-NNNN case ID shown in Missing persons.', 404)
-        s = Sighting(case_id=case.case_id, reported_by=current_user().id, photo=save_file(request.files.get('photo')),
-                     description=d.get('description'), location_name=d.get('location_name'))
-        db.session.add(s); add_timeline(case.case_id, 'SIGHTING_REPORTED', 'Citizen sighting submitted.', current_user().id)
-        notify_case(case.case_id, 'New sighting reported', f'A new sighting was reported for {case.case_id}.')
-        db.session.commit(); return jsonify(message='Sighting submitted for investigator review.'), 201
-    except ValueError as e:
-        return api_error(str(e))
+        description = (data.get('description') or '').strip()
+        location_name = (data.get('location_name') or '').strip()
+        if len(description) > 5000 or len(location_name) > 200:
+            return api_error('Description must be 5,000 characters or fewer and location must be 200 characters or fewer.')
+        raw_date = (data.get('sighting_date') or '').strip()
+        raw_time = (data.get('sighting_time') or '').strip()
+        try:
+            sighting_date = date.fromisoformat(raw_date) if raw_date else None
+            sighting_time = datetime.strptime(raw_time, '%H:%M').strftime('%H:%M') if raw_time else None
+        except ValueError:
+            return api_error('Sighting date or time is invalid.')
+        photo = save_sighting_photo(request.files.get('photo'))
+        report = Sighting(
+            case_id=case.case_id,
+            reported_by=current_user().id,
+            photo=photo,
+            description=description or None,
+            location_name=location_name or None,
+            sighting_date=sighting_date,
+            sighting_time=sighting_time,
+            reported_at=datetime.utcnow(),
+            status='SUBMITTED',
+            review_status='PENDING_REVIEW',
+        )
+        db.session.add(report)
+        db.session.flush()
+        db.session.add(Timeline(case_id=case.case_id, event_type='SIGHTING_REPORTED',
+            description=f'Citizen submitted sighting report #{report.id} for authorized review.', created_by=current_user().id))
+        db.session.add(Notification(
+            user_id=case.registered_by,
+            title='New sighting reported',
+            message=f'A citizen submitted sighting report #{report.id} for {case.case_id}. Police review is pending.',
+            type='sighting_report',
+            sighting_id=report.id,
+        ))
+        db.session.commit()
+        return jsonify(message='Sighting submitted for police review.', sighting_id=report.id, review_status=report.review_status), 201
+    except ValueError as error:
+        db.session.rollback()
+        if photo:
+            try:
+                os.remove(os.path.join(app.config['UPLOAD_FOLDER'], photo))
+            except OSError:
+                app.logger.exception('Could not remove a rejected sighting photo.')
+        return api_error(str(error))
+    except SQLAlchemyError:
+        db.session.rollback()
+        if photo:
+            try:
+                os.remove(os.path.join(app.config['UPLOAD_FOLDER'], photo))
+            except OSError:
+                app.logger.exception('Could not remove a failed sighting photo.')
+        app.logger.exception('Failed to save sighting report.')
+        return api_error('Sighting could not be saved. Please try again.', 500)
+
+
+@app.get('/api/sightings/<int:sighting_id>')
+@require_auth()
+def get_sighting(sighting_id):
+    report = db.session.get(Sighting, sighting_id)
+    user = current_user()
+    if not report or not can_access_sighting(report, user):
+        return api_error('Sighting report not found.', 404)
+    return jsonify(report=sighting_json(report))
+
+
+@app.get('/api/sightings/<int:sighting_id>/photo')
+@require_auth()
+def get_sighting_photo(sighting_id):
+    report = db.session.get(Sighting, sighting_id)
+    if not report or not report.photo or not can_access_sighting(report, current_user()):
+        return api_error('Sighting photo not found.', 404)
+    filename = os.path.basename(report.photo)
+    if report.photo.startswith('sightings/'):
+        return send_from_directory(os.path.join(app.config['UPLOAD_FOLDER'], 'sightings'), filename)
+    # Legacy sighting photos were stored at the upload root; access is still checked above.
+    return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
+
+
+@app.get('/api/police/sightings')
+@require_auth({'POLICE_OFFICER', 'ADMIN_DEMO'})
+def list_police_sightings():
+    reports = Sighting.query.order_by(Sighting.reported_at.desc()).limit(200).all()
+    return jsonify(items=[sighting_json(report) for report in reports])
+
+
+@app.put('/api/police/sightings/<int:sighting_id>')
+@require_auth({'POLICE_OFFICER', 'ADMIN_DEMO'})
+def update_police_sighting(sighting_id):
+    report = db.session.get(Sighting, sighting_id)
+    if not report:
+        return api_error('Sighting report not found.', 404)
+    data = request.get_json(silent=True) or {}
+    review_status = str(data.get('review_status') or '').strip().upper()
+    allowed = {'PENDING_REVIEW', 'UNDER_REVIEW', 'REVIEWED', 'NOT_RELEVANT'}
+    if review_status not in allowed:
+        return api_error('Choose a valid police review status.')
+    report.review_status = review_status
+    case = MissingPerson.query.filter_by(case_id=report.case_id).first()
+    if case:
+        add_timeline(case.case_id, 'SIGHTING_REVIEW_UPDATED',
+            f'Police review status for sighting report #{report.id} set to {review_status.replace("_", " ")}.', current_user().id)
+        db.session.add(Notification(
+            user_id=case.registered_by,
+            title='Sighting review updated',
+            message=f'Police review status for sighting report #{report.id} on {case.case_id}: {review_status.replace("_", " ")}. This is not a confirmed match.',
+            type='sighting_report',
+            sighting_id=report.id,
+        ))
+    db.session.commit()
+    return jsonify(message='Police review status updated.', report=sighting_json(report))
 
 
 @app.post('/api/found-persons')
@@ -2231,7 +2438,22 @@ def retry_email(email_id):
 @app.get('/api/notifications')
 @require_auth()
 def notifications():
-    rows = Notification.query.filter_by(user_id=current_user().id).order_by(Notification.created_at.desc()).all(); return jsonify(items=[{'id': n.id, 'title': n.title, 'message': n.message, 'is_read': n.is_read, 'created_at': n.created_at.isoformat()} for n in rows])
+    user = current_user()
+    rows = Notification.query.filter_by(user_id=user.id).order_by(Notification.created_at.desc()).all()
+    items = []
+    for notification in rows:
+        report = db.session.get(Sighting, notification.sighting_id) if notification.sighting_id else None
+        sighting_id = report.id if report and can_access_sighting(report, user) else None
+        items.append({
+            'id': notification.id,
+            'title': notification.title,
+            'message': notification.message,
+            'is_read': notification.is_read,
+            'created_at': notification.created_at.isoformat(),
+            'type': notification.type,
+            'sighting_id': sighting_id,
+        })
+    return jsonify(items=items)
 
 
 @app.put('/api/notifications/<int:nid>/read')
@@ -2562,6 +2784,60 @@ def update_police_case(case_id):
     return jsonify(message='Emergency case updated.', case=emergency_case_json(case))
 
 
+def backfill_sighting_notification_links():
+    used_report_ids = {row[0] for row in db.session.query(Notification.sighting_id).filter(Notification.sighting_id.isnot(None)).all()}
+    legacy = Notification.query.filter(
+        Notification.title == 'New sighting reported',
+        Notification.sighting_id.is_(None),
+    ).all()
+    for notification in legacy:
+        match = re.search(r'JR-\d{4}-\d{4}', notification.message or '')
+        if not match:
+            continue
+        case_id = match.group(0)
+        case = MissingPerson.query.filter_by(case_id=case_id).first()
+        if not case or case.registered_by != notification.user_id:
+            continue
+        reports = Sighting.query.filter_by(case_id=case_id).all()
+        candidates = sorted(
+            (report for report in reports if report.id not in used_report_ids and report.reported_at),
+            key=lambda report: abs((report.reported_at - notification.created_at).total_seconds()),
+        )
+        if not candidates:
+            continue
+        distance = abs((candidates[0].reported_at - notification.created_at).total_seconds())
+        if distance > 600:
+            continue
+        if len(candidates) > 1:
+            next_distance = abs((candidates[1].reported_at - notification.created_at).total_seconds())
+            if abs(next_distance - distance) < 1:
+                continue
+        notification.sighting_id = candidates[0].id
+        used_report_ids.add(candidates[0].id)
+    db.session.commit()
+
+
+def ensure_sighting_schema():
+    additions = {
+        'sighting': {
+            'sighting_date': 'DATE',
+            'sighting_time': 'VARCHAR(10)',
+            'review_status': "VARCHAR(30) NOT NULL DEFAULT 'PENDING_REVIEW'",
+        },
+        'notification': {'sighting_id': 'INTEGER'},
+    }
+    inspector = inspect(db.engine)
+    for table, columns in additions.items():
+        if not inspector.has_table(table):
+            continue
+        existing = {column['name'] for column in inspector.get_columns(table)}
+        for column, definition in columns.items():
+            if column not in existing:
+                db.session.execute(text(f'ALTER TABLE {table} ADD COLUMN {column} {definition}'))
+    db.session.commit()
+    backfill_sighting_notification_links()
+
+
 @app.errorhandler(413)
 def too_large(e):
     return api_error('File is too large.', 413)
@@ -2577,4 +2853,5 @@ def spa(e):
 if __name__ == '__main__':
     with app.app_context():
         db.create_all()
+        ensure_sighting_schema()
     app.run(debug=True, use_reloader=True)
